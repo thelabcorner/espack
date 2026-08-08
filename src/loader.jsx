@@ -242,6 +242,20 @@ __ESB64_RUNTIME__
   }
 
   function load(i) {
+    /* Engine guard: the ExtendScript File/Folder APIs below throw
+       ReferenceError in non-ExtendScript engines (e.g. Node test
+       harnesses evaluating the bundle for interop checks). Degrade to
+       ES3 mode instead of escaping - the bundle is fully functional in
+       pure ES3 without ExternalObject. */
+    try {
+      return loadInner(i);
+    } catch (e) {
+      state.lastError = "ESPAK: load failed (engine lacks ExtendScript File/Folder APIs?): " + String(e);
+      return { ok: false, mode: "es3", error: state.lastError, lib: null, path: "" };
+    }
+  }
+
+  function loadInner(i) {
     var t0 = 0;
     try { $.hiresTimer; t0 = $.hiresTimer; } catch (e0) {}
     state.lastError = "";
