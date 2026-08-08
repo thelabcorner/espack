@@ -1,0 +1,32 @@
+{
+  "name": "espack",
+  "version": "0.2.0",
+  "description": "ESPACK - self-extracting single-file ExternalObject bundles for ExtendScript (ES3). At build time a DLL is embedded as base64 inside a .jsx; at runtime the JSX unpacks itself (chunked decode via the inlined esb64 atob lane), materializes the DLL into a per-user cache dir, loads it via ExternalObject, and switches a consumer library from its ES3 fallback to the native accelerated implementation.",
+  "type": "module",
+  "main": "espack-build.mjs",
+  "scripts": {
+    "build": "node espack-build.mjs",
+    "vendor-sync": "node espack-vendor-sync.mjs",
+    "test": "node tests/espack-test.mjs && node tests/vendor-sync-test.mjs",
+    "e2e": "node tests/espack-e2e.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thelabcorner/espack.git"
+  },
+  "keywords": [
+    "extendscript",
+    "es3",
+    "externalobject",
+    "dll",
+    "self-extracting",
+    "base64",
+    "atob",
+    "illustrator",
+    "single-file"
+  ]
+}
