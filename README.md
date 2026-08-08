@@ -57,6 +57,7 @@ Runtime order: start in ES3 mode → the inlined lane unpacks the accelerator (o
 ## Features
 
 - **Single-file distribution**: the packer inlines the shared accelerator and every payload DLL as base64 into one self-contained `.jsx` — no `$.evalFile`, no `#include`, no references to DLL or vendor paths. Runtime always materializes the DLLs on disk (`ExternalObject` requires a file path; there is no in-memory load).
+- **A complete esb64 ships inside every bundle, by construction.** The JSX extractor IS the vendored esb64 runtime lane (`vendor/esb64-runtime.js` — WHATWG-exact `atob`/`btoa`, the same code esb64 ships) — the bundle cannot exist without it, because it decodes its own payloads. Once the shared accelerator is materialized and loaded, the same codec is also available natively (`b64encode`/`b64decode`/`b64decodeToFile`). A script that evals an espack bundle already has base64 — use it (see [API](#api)) before vendoring a second copy.
 - **"1 + n" model**: one shared esb64 accelerator unpacked once per system (reused by every espack bundle on the machine); every payload decoded natively by `b64decodeToFile` — **3-10 µs** instead of ~140 ms of JSX-lane decoding (measured, live).
 - **Byte-exact BINARY I/O**: file `"BINARY"` reads/writes round-trip **all 256 byte values** including NULs (the surrogate window is a JS↔native *string-channel* problem, not a BINARY-file problem — verified).
 - **Versioned, GC'd cache**: extracted files are `<name>_v<version>.dll`, extracted once, **never deleted while loaded** (locked until host exit); older versions are GC'd best-effort after a successful extraction, scoped per DLL name.
@@ -220,6 +221,38 @@ silently and survive until the host exits — verified live). GC masks are
 scoped per DLL name, so different DLLs in the same directory never touch
 each other. Loaded libraries are cached on `$.global.__ESPAK_LIBS__` keyed
 by path.
+
+#### Base64 is built in — use it
+
+Every bundle carries esb64 (see [Features](#features)): the WHATWG-exact ES3
+lane inlined as the extractor, and — once the shared accelerator is on disk
+and loaded — the same codec natively. Two ways to reach it:
+
+```js
+// 1. direct native calls, once the lib is loaded:
+var r = ESPAK.load(0);
+if (r.mode === "native") {
+  var b64 = r.lib.b64encode("Hello World");   // "SGVsbG8gV29ybGQ="
+  var raw = r.lib.b64decode(b64);             // "Hello World"
+}
+// r.lib.b64decodeToFile(b64, path) writes bytes straight to disk (NUL-safe)
+```
+
+```js
+// 2. the capability switch — full atob/btoa contract, ES3-first:
+ESPAK.attach({
+  es3: { atob: myEs3Atob, btoa: myEs3Btoa },
+  buildNative: function (lib) {
+    return { atob: function (s) { return lib.b64decode(s); },
+             btoa: function (s) { return lib.b64encode(s); } };
+  }
+});
+// mode "es3" keeps your impls; mode "native" swaps in the lib-backed ones
+```
+
+If you need a ready-made full facade, esb64's own accelerated bundle
+(`ESB64.accel.jsx`, shipped in esb64 v1.1.0) is the reference
+implementation of this exact pattern.
 
 #### The capability switch (`attach`)
 
