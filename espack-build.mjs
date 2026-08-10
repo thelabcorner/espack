@@ -20,7 +20,7 @@ import { readFileSync, writeFileSync, mkdirSync, statSync, existsSync } from 'no
 import { join, dirname, basename, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-var VERSION = '0.3.0';
+var VERSION = '0.4.0';
 var CHUNK_SIZE = 24576; // measured on Illustrator 30.6.0: atob decode is linear
 // (~1 us/base64 char, no engine wedge through 64K passes); 24K is conservative.
 
@@ -85,19 +85,31 @@ function normalizePathOption(v) {
 
 function embedPayload(spec, defaultVersion) {
   var r = resolveEmbedSpec(spec, defaultVersion);
-  if (!existsSync(r.path)) throw new Error('espack: DLL not found: ' + r.path);
+  if (!existsSync(r.path)) throw new Error('espack: file not found: ' + r.path);
   var st = statSync(r.path);
   if (!st.isFile()) throw new Error('espack: not a file: ' + r.path);
   var bytes = readFileSync(r.path);
-  var name = sanitize(basename(r.path, extname(r.path)), 'payload');
+  var ext = extname(r.path);
+  var name = sanitize(basename(r.path, ext), 'payload');
   var version = sanitize(r.version, '1');
   return {
     name: name,
     version: version,
     len: bytes.length,
     b64: bytes.toString('base64'),
-    fileName: name + '_v' + version + '.dll'
+    kind: ext.toLowerCase() === '.dll' ? 'dll' : 'file',
+    fileName: name + '_v' + version + (ext || '.dll')
   };
+}
+
+function manifestPayload(p) {
+  var out = clonePayload(p);
+  if (out.kind === 'dll') delete out.kind;
+  return out;
+}
+
+function manifestPayloads(payloads) {
+  return payloads.map(function (p) { return manifestPayload(p); });
 }
 
 export function makeManifest(opts) {
@@ -108,8 +120,14 @@ export function makeManifest(opts) {
     cacheDir: opts.cacheDir,
     chunkSize: CHUNK_SIZE,
     accel: opts.accel ? cloneManifestAccel(opts.accel) : null,
-    payloads: clonePayloads(opts.payloads || []),
+    payloads: manifestPayloads(opts.payloads || []),
   };
+}
+
+function payloadKind(p) {
+  if (p.kind === 'file') return 'file';
+  if (p.kind === 'dll') return 'dll';
+  return /\.dll$/i.test(String(p.fileName || '')) ? 'dll' : 'file';
 }
 
 function clonePayload(p) {
@@ -118,7 +136,8 @@ function clonePayload(p) {
     version: String(p.version),
     len: Number(p.len),
     b64: String(p.b64),
-    fileName: String(p.fileName || (p.name + '_v' + p.version + '.dll'))
+    fileName: String(p.fileName || (p.name + '_v' + p.version + '.dll')),
+    kind: payloadKind(p)
   };
 }
 
@@ -185,8 +204,9 @@ export function validateManifest(m, label) {
 function payloadsLiteral(payloads) {
   return '[' +
     payloads.map(function (p) {
+      var kindPart = p.kind === 'file' ? ', kind: "file"' : '';
       return '{ name: ' + JSON.stringify(p.name) + ', version: ' + JSON.stringify(p.version) +
-        ', len: ' + p.len + ', b64: ' + JSON.stringify(p.b64) + ', fileName: ' + JSON.stringify(p.fileName) + ' }';
+        ', len: ' + p.len + ', b64: ' + JSON.stringify(p.b64) + ', fileName: ' + JSON.stringify(p.fileName) + kindPart + ' }';
     }).join(', ') +
     ']';
 }
@@ -209,7 +229,7 @@ export function renderBundle(opts) {
   var runtimeWrapper = 'var __espakB64 = (function () {\n' + runtime + '\nreturn ESB64;\n}());';
 
   var payloadSummary = payloads.length
-    ? payloads.map(function (p) { return p.name + '_v' + p.version + '.dll (' + p.len + ' B)'; }).join(', ')
+    ? payloads.map(function (p) { return p.fileName + ' (' + p.len + ' B)'; }).join(', ')
     : '(none)';
   var accelSummary = accel ? accel.name + '_v' + accel.version + '.dll (' + accel.len + ' B, shared)' : '(none)';
 

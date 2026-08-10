@@ -135,6 +135,33 @@ function evalConfig(bundlePath) {
   return env.result;
 }
 
+// Arbitrary-file payload probe: extract() materializes byte-exact; load() rejects.
+var SMOKE_FILE = '(function () {' +
+  '  var out = { ok: false, error: null };' +
+  '  try {' +
+  '    var ESP = $.global.ESPAK;' +
+  '    if (!ESP) { out.error = "ESPAK not installed on $.global"; return out; }' +
+  '    out.kind = ESP.config.payloads[0].kind;' +
+  '    out.fileName = ESP.config.payloads[0].fileName;' +
+  '    var x = ESP.extract(0);' +
+  '    out.extractOk = x.ok; out.extractLane = x.lane;' +
+  '    out.isExtracted = ESP.isExtracted(0);' +
+  '    out.path = ESP.payloadPath(0);' +
+  '    var l = ESP.load(0);' +
+  '    out.loadRejected = l.ok === false;' +
+  '    out.loadError = l.error;' +
+  '    out.ok = x.ok && !l.ok;' +
+  '  } catch (e) { out.error = String(e); }' +
+  '  return out;' +
+  '}());';
+
+function evalFilePayload(bundlePath) {
+  var env = runTool(['eval', '--code',
+    '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return ' + SMOKE_FILE]);
+  if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
+  return env.result;
+}
+
 var SMOKE = '(function () {' +
   '  var out = { ok: false, error: null };' +
   '  try {' +
@@ -369,6 +396,22 @@ check('merged re-run: files untouched (mtime unchanged)', statSync(join(mergeADi
 var cfgM = evalConfig(merged.outPath);
 check('facade: merged still active after re-eval (last-wins)', cfgM.bundleName === 'espack-e2e-mergeA' && cfgM.payloads === 2, JSON.stringify(cfgM));
 console.log('      merged extractMs=' + smM1.extractMs + ' us (' + (smM1.extractMs / 1000).toFixed(1) + ' ms)  re-run extractMs=' + smM2.extractMs + ' us');
+
+// ---- arbitrary-file payload (kind=file): byte-exact extract, load() rejects ----
+console.log('E2E: arbitrary-file payload (kind=file)...');
+var fileBytes = Buffer.concat([Buffer.from('MZ\x90\x00'), Buffer.from('FAKE EXE PAYLOAD 0123456789'), Buffer.from('\x00\x00\x00\x00PE')]);
+var toolExe = join(DIST, 'Tool.exe');
+writeFileSync(toolExe, fileBytes);
+var fileBundle = build({ embed: toolExe, out: join(DIST, 'espack-e2e-file.jsx'), name: 'espack-e2e-file', dllVersion: '1' });
+check('file: kind=file, versioned exe name', fileBundle.payloads[0].kind === 'file' && fileBundle.payloads[0].fileName === 'Tool_v1.exe', JSON.stringify(fileBundle.payloads[0]));
+var sf = evalFilePayload(fileBundle.outPath);
+check('file: bundle evals, extract ok, load rejected', sf.ok === true && sf.extractOk === true && sf.loadRejected === true, JSON.stringify(sf));
+check('file: extract via native lane (shared accel) or skip', sf.extractLane === 'native' || sf.extractLane === 'skip', 'lane=' + sf.extractLane);
+check('file: kind surfaced in config', sf.kind === 'file', 'kind=' + sf.kind);
+check('file: isExtracted after extract', sf.isExtracted === true, 'isExtracted=' + sf.isExtracted);
+check('file: load error mentions kind=file', /kind=file/.test(String(sf.loadError)), 'loadError=' + sf.loadError);
+check('file: extracted file on disk with exe name', existsSync(join(process.env.LOCALAPPDATA, 'espack-e2e-file', 'Tool_v1.exe')));
+check('file: extracted bytes byte-exact vs source', readFileSync(join(process.env.LOCALAPPDATA, 'espack-e2e-file', 'Tool_v1.exe')).equals(fileBytes));
 
 // ---- cleanup -------------------------------------------------------------------
 console.log('E2E: closing instance B...');

@@ -96,7 +96,7 @@ __ESB64_RUNTIME__
   function gcOldVersions(dir, name, currentFile) {
     try {
       var folder = new Folder(dir);
-      var matches = folder.getFiles(name + "_v*.dll");
+      var matches = folder.getFiles(name + "_v*");
       var i;
       for (i = 0; i < matches.length; i++) {
         if (String(matches[i].name) !== currentFile) {
@@ -333,6 +333,11 @@ __ESB64_RUNTIME__
       try { state.loadMs = $.hiresTimer - t0; } catch (e3) {}
       return { ok: true, mode: "native", lib: state.accelLib, path: accelPath() };
     }
+    if (payloadKind(idx) === "file") {
+      /* arbitrary bundled file: materialize via extract(), never ExternalObject */
+      state.lastError = "ESPAK: payload " + PAYLOADS[idx].name + " is kind=file (not a loadable DLL); use extract()/payloadPath()";
+      return { ok: false, mode: "es3", error: state.lastError, lib: null, path: payloadPath(idx) };
+    }
     if (!isExtracted(idx)) {
       loadAccelLib(); /* best-effort: the payload falls back to the JSX lane if this fails */
       var r = extractPayload(idx);
@@ -379,6 +384,12 @@ __ESB64_RUNTIME__
     return idx;
   }
 
+  /* Payload kind: "dll" (default - loadable via ExternalObject) or "file"
+     (arbitrary bundled file - extract()/payloadPath() only, never load()). */
+  function payloadKind(i) {
+    return PAYLOADS[i] && PAYLOADS[i].kind === "file" ? "file" : "dll";
+  }
+
   function attach(opts, i) {
     opts = opts || {};
     var result = load(i);
@@ -401,7 +412,7 @@ __ESB64_RUNTIME__
   function payloadSummary() {
     var a = [], k;
     for (k = 0; k < PAYLOADS.length; k++) {
-      a.push({ name: PAYLOADS[k].name, version: PAYLOADS[k].version, fileName: PAYLOADS[k].fileName, len: PAYLOADS[k].len });
+      a.push({ name: PAYLOADS[k].name, version: PAYLOADS[k].version, fileName: PAYLOADS[k].fileName, len: PAYLOADS[k].len, kind: payloadKind(k) });
     }
     return a;
   }
@@ -433,7 +444,7 @@ __ESB64_RUNTIME__
     extract: function (i) {
       var idx = resolvePayload(i);
       if (idx === -1) return { ok: false, error: "ESPAK: unknown payload " + String(i) };
-      if (isExtracted(idx)) return { ok: true, already: true, path: payloadPath(idx) };
+      if (isExtracted(idx)) return { ok: true, already: true, lane: "skip", path: payloadPath(idx) };
       loadAccelLib();
       return extractPayload(idx);
     },

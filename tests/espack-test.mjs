@@ -11,7 +11,7 @@
 //   - chunk-boundary mirror: the loader's chunk arithmetic decoded in Node
 //     must reproduce the embedded bytes exactly.
 import assert from 'node:assert';
-import { build } from '../espack-build.mjs';
+import { build, makeManifest, renderBundle } from '../espack-build.mjs';
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, rmdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
@@ -172,6 +172,63 @@ test('packer: rejects nothing to embed', function () {
   assert.throws(function () { build({ out: join(TMP, 'x.jsx'), accel: false }); }, /nothing to embed/);
 });
 
+// ---- arbitrary-file payloads (kind=file; DLLs stay byte-compatible) ----------
+
+test('packer: arbitrary-file embed preserves extension + kind (exe)', function () {
+  var dir = mkdtempSync(join(TMP, 'file-'));
+  var exe = writeDll(dir, 'Tool.exe', DLL_1);
+  var out = join(dir, 'out.jsx');
+  var r = build({ embed: exe, out: out, name: 'filebundle', accel: false });
+  assert.strictEqual(r.payloads.length, 1);
+  assert.strictEqual(r.payloads[0].name, 'Tool');
+  assert.strictEqual(r.payloads[0].kind, 'file');
+  assert.strictEqual(r.payloads[0].fileName, 'Tool_v1.exe');
+  assert.ok(r.text.indexOf('var PAYLOADS = [{ name: "Tool", version: "1", len: ' + DLL_1.length + ', b64: "') >= 0, 'payloads literal');
+  assert.ok(r.text.indexOf(', kind: "file" }];') >= 0, 'kind rendered only for files');
+  var m = makeManifest({ bundleName: 'filebundle', cacheDir: '', accel: null, payloads: r.payloads });
+  assert.strictEqual(m.payloads[0].kind, 'file', 'manifest payload kind');
+  assert.ok(JSON.stringify(m).indexOf('"kind":"file"') >= 0, 'manifest serializes kind');
+});
+
+test('packer: dll payloads emit no kind (0.3.0 byte-compat)', function () {
+  var r = buildOnce({ dllName: 'FakeDll.dll', name: 'mybundle', dllVersion: '1' });
+  assert.strictEqual(r.payloads[0].kind, 'dll');
+  assert.ok(r.text.indexOf(', kind: "file" }') < 0, 'no file-kind literal in dll bundle text');
+  var m = makeManifest({ bundleName: 'mybundle', cacheDir: '', accel: null, payloads: r.payloads });
+  assert.strictEqual(m.payloads[0].kind, undefined, 'manifest omits dll kind');
+  assert.ok(JSON.stringify(m).indexOf('"kind"') < 0, 'manifest serializes no kind for dll');
+});
+
+test('packer: mixed dll + file bundle renders both, kind on file only', function () {
+  var dir = mkdtempSync(join(TMP, 'mix-'));
+  var dll = writeDll(dir, 'LibA.dll', DLL_1);
+  var txt = writeDll(dir, 'readme.txt', Buffer.from('hello espack file payload'));
+  var out = join(dir, 'out.jsx');
+  var r = build({ embed: [dll, txt], out: out, name: 'mix', accel: false });
+  assert.strictEqual(r.payloads.length, 2);
+  assert.strictEqual(r.payloads[0].fileName, 'LibA_v1.dll');
+  assert.strictEqual(r.payloads[0].kind, 'dll');
+  assert.strictEqual(r.payloads[1].fileName, 'readme_v1.txt');
+  assert.strictEqual(r.payloads[1].kind, 'file');
+  assert.ok(r.text.indexOf('{ name: "readme", version: "1", len: 25, b64: "') >= 0, 'file literal');
+  assert.ok(r.text.indexOf(', kind: "file" }') >= 0, 'file kind rendered');
+  assert.ok(r.text.indexOf('{ name: "LibA", version: "1", len: ' + DLL_1.length + ', b64: "') >= 0, 'dll literal without kind');
+});
+
+test('packer: manifest inference - kind-less payloads default to dll by fileName', function () {
+  var dir = mkdtempSync(join(TMP, 'infer-'));
+  var dll = writeDll(dir, 'LibA.dll', DLL_1);
+  var r = build({ embed: dll, out: join(dir, 'out.jsx'), name: 'infer', accel: false });
+  var legacy = {
+    format: 'espack-manifest', version: 1, bundleName: 'infer', cacheDir: '', chunkSize: 24576,
+    accel: null,
+    payloads: [{ name: 'LibA', version: '1', len: r.payloads[0].len, b64: r.payloads[0].b64, fileName: 'LibA_v1.dll' }]
+  };
+  var rb = renderBundle({ bundleName: 'infer', cacheDir: '', payloads: legacy.payloads, accel: null });
+  assert.ok(rb.indexOf(', kind: "file" }') < 0, 'kind-less manifest payload renders as dll (no kind)');
+  assert.ok(rb.indexOf('{ name: "LibA", version: "1", len: ' + r.payloads[0].len + ', b64: "') >= 0, 'dll literal intact');
+});
+
 // ---- chunk boundary mirror (loader arithmetic in Node) -----------------------
 
 test('chunking: mirrors loader decode for many payload sizes', function () {
@@ -308,7 +365,7 @@ test('loader: extract writes byte-exact DLL, load reaches native, attach swaps',
   runBundle(sandbox, r);
   var ESPAK = sandbox.ESPAK;
   assert.ok(ESPAK, 'ESPAK installed on $.global');
-  assert.strictEqual(ESPAK.version, '0.3.0');
+  assert.strictEqual(ESPAK.version, '0.4.0');
   assert.strictEqual(ESPAK.config.payloads.length, 1);
   assert.strictEqual(ESPAK.config.payloads[0].fileName, 'FakeDll_v1.dll');
   assert.strictEqual(ESPAK.config.accel, null, 'no accel in bundle');
@@ -386,6 +443,52 @@ test('loader: GC removes older versions after extraction', function () {
   assert.strictEqual(e.ok, true);
   assert.ok(!existsSync(join(dir, 'FakeDll_v1.dll')), 'old version removed');
   assert.ok(existsSync(join(dir, 'other_v9.dll')), 'other DLL untouched');
+});
+
+test('loader: file-kind payload extracts byte-exact, load() rejects cleanly', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var dir = mkdtempSync(join(TMP, 'file-'));
+  var exeBytes = Buffer.concat([Buffer.from('MZ'), fakeDll(4096), Buffer.from('PE')]);
+  var exe = writeDll(dir, 'Tool.exe', exeBytes);
+  var out = join(dir, 'out.jsx');
+  var r = build({ embed: exe, out: out, name: 'filebundle', accel: false });
+  assert.strictEqual(r.payloads[0].kind, 'file');
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  runBundle(sandbox, r);
+  var ESPAK = sandbox.ESPAK;
+  assert.strictEqual(ESPAK.config.payloads[0].fileName, 'Tool_v1.exe');
+  var x = ESPAK.extract(0);
+  assert.strictEqual(x.ok, true, 'extract ok: ' + JSON.stringify(x));
+  var got = readFileSync(ESPAK.payloadPath(0).replace(/\//g, '\\'));
+  assert.ok(got.equals(exeBytes), 'byte-exact extract');
+  assert.ok(ESPAK.isExtracted(0), 'isExtracted');
+  var l = ESPAK.load(0);
+  assert.strictEqual(l.ok, false, 'load rejects file-kind');
+  assert.ok(/kind=file/.test(l.error), 'clear error: ' + l.error);
+  assert.strictEqual(l.mode, 'es3');
+  var l2 = ESPAK.load('Tool');
+  assert.strictEqual(l2.ok, false, 'load by name also rejects');
+});
+
+test('loader: GC removes old versions of file payloads (extension-agnostic mask)', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var dir = mkdtempSync(join(TMP, 'file-'));
+  var bytes1 = fakeDll(1000);
+  var bytes2 = fakeDll(1000, 3);
+  var exe = writeDll(dir, 'Tool.exe', bytes1);
+  var out = join(dir, 'out.jsx');
+  var r1 = build({ embed: exe + '=1', out: out, name: 'gcb', accel: false });
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  runBundle(sandbox, r1);
+  assert.strictEqual(sandbox.ESPAK.extract(0).ok, true);
+  var oldPath = join(root, 'gcb', 'Tool_v1.exe');
+  assert.ok(existsSync(oldPath), 'v1 extracted');
+  var r2 = build({ embed: writeDll(dir, 'Tool.exe', bytes2) + '=2', out: out, name: 'gcb', accel: false });
+  var sandbox2 = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  runBundle(sandbox2, r2);
+  assert.strictEqual(sandbox2.ESPAK.extract(0).ok, true);
+  assert.ok(existsSync(join(root, 'gcb', 'Tool_v2.exe')), 'v2 extracted');
+  assert.ok(!existsSync(oldPath), 'v1 GCd by extension-agnostic mask');
 });
 
 test('loader: fail-open -> extract error surfaced, load stays es3', function () {

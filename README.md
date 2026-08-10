@@ -63,6 +63,7 @@ Runtime order: start in ES3 mode → the inlined lane unpacks the accelerator (o
 - **"1 + n" model**: one shared esb64 accelerator unpacked once per system (reused by every espack bundle on the machine); every payload decoded natively by `b64decodeToFile` — **3-10 µs** instead of ~140 ms of JSX-lane decoding (measured, live).
 - **Byte-exact BINARY I/O**: file `"BINARY"` reads/writes round-trip **all 256 byte values** including NULs (the surrogate window is a JS↔native *string-channel* problem, not a BINARY-file problem — verified).
 - **Versioned, GC'd cache**: extracted files are `<name>_v<version>.dll`, extracted once, **never deleted while loaded** (locked until host exit); older versions are GC'd best-effort after a successful extraction, scoped per DLL name.
+- **Arbitrary-file payloads** (`kind=file`): `--embed` accepts **any file** — EXEs, PNGs, fonts, JSON, anything. The original extension is preserved in the versioned cache name (`Tool_v1.exe`), extraction is byte-exact through the same native/JSX lanes, and GC works identically. Non-DLL payloads are materialized via `ESPAK.extract(i)` / `ESPAK.payloadPath(i)`; `ESPAK.load(i)` rejects them with a clear `kind=file` error instead of ever feeding a non-DLL to `ExternalObject`. DLL payloads are unchanged and byte-compatible with v0.3.0.
 - **Deterministic output**: the emitted bundle contains no timestamps; identical input produces byte-identical output.
 - **The `attach` capability switch**: the consumer pattern esb64 and eson use — the library's ES3 impls stay in place until the native lib is loaded and the native impls are built; any failure keeps the bundle in ES3 mode with the reason surfaced, never a thrown consumer-facing error.
 - **Zero dependencies**: the packer is Node ESM with no runtime deps; the emitted loader is ES3-clean.
@@ -127,7 +128,7 @@ valid `{"a":1}`). Fixed in `eson/src/parse.ts` (NUL texts never memoized).
 **How it works, in three steps:**
 
 1. Open the [Releases page](https://github.com/thelabcorner/espack/releases).
-2. Pick the **latest stable** tag (top of the list — today that is `v0.3.0`).
+2. Pick the **latest stable** tag (top of the list — today that is `v0.4.0`).
 3. Download the asset that matches your use case:
 
 | You are... | Take this release | And this asset |
@@ -154,6 +155,7 @@ npm run vendor-sync  # refresh vendor/ from the sibling esb64 build (optional)
 
 ```bash
 node espack-build.mjs --embed path/to/MyDll.dll --embed OtherDll.dll=2 \
+     --embed path/to/Tool.exe --embed path/to/logo.png \
      --out dist/MyBundle.jsx --name mybundle
 ```
 
@@ -265,9 +267,10 @@ ESPAK.config;             // { bundleName, cacheDir, chunkSize,
                           //   accel: { name, version, fileName, len, dir } | null,
                           //   payloads: [{ name, version, fileName, len }] }
 ESPAK.load(i);            // load payload i (index or name; default 0); extract-if-
-                          //   needed -> new ExternalObject; { ok, mode, lib, path }
-ESPAK.attach(opts, i);    // capability switch (below)
-ESPAK.extract(i);         // { ok, lane: "native"|"jsx", path }
+                          //   needed -> new ExternalObject; { ok, mode, lib, path }.
+                          //   Rejects kind=file payloads (not loadable DLLs).
+ESPAK.extract(i);         // { ok, lane: "native"|"jsx"|"skip", path } - materialize any
+                          //   payload (DLL or arbitrary file) to the cache dir
 ESPAK.isExtracted(i);     // file exists && size matches (size + versioned name)
 ESPAK.mode();             // "es3" | "native"
 ESPAK.lastError();
@@ -288,6 +291,30 @@ silently and survive until the host exits — verified live). GC masks are
 scoped per DLL name, so different DLLs in the same directory never touch
 each other. Loaded libraries are cached on `$.global.__ESPAK_LIBS__` keyed
 by path.
+
+#### Arbitrary-file payloads (EXEs, assets, anything)
+
+`--embed` accepts **any file**, not just DLLs. Non-DLL payloads are tagged
+`kind=file`: the original extension is preserved in the versioned cache name
+(`Tool_v1.exe`), extraction is byte-exact via the same native (`b64decodeToFile`)
+or JSX lanes, and GC works identically. They are **never** handed to
+`ExternalObject` — use `extract()` + `payloadPath()` instead:
+
+```js
+var x = ESPAK.extract('Tool');          // { ok: true, lane: "native", path }
+if (x.ok) {
+  var exe = new File(x.path);           // Tool_v1.exe in the cache dir
+  exe.execute();                        // spawn it (Windows)
+}
+var r = ESPAK.load('Tool');             // { ok: false, error: "...kind=file..." }
+// load() rejects kind=file payloads with a clear error - no ExternalObject.
+```
+
+Typical use: ship a freestanding helper EXE (or a logo PNG, a font, a JSON
+asset) inside the same self-extracting bundle as your DLLs — the Scripts
+folder stays `.jsx`-only and everything materializes on first use. DLL
+payloads are unchanged and byte-compatible with v0.3.0 (no `kind` is emitted
+for them in bundles or manifests).
 
 #### Base64 is built in — use it
 
