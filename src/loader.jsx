@@ -5,6 +5,8 @@
  * Accelerator (1, shared across all espack bundles): __ACCEL_SUMMARY__
  * Cache dirs: payloads %LOCALAPPDATA%/<bundle name>, accelerator %LOCALAPPDATA%/espack (or __ACCEL_DIR__)
  * Runtime decode chunk: __CHUNK_SIZE__ base64 chars per pass (JSX lane; measured: linear atob, no engine wedge)
+ * Accel-less bundles discover the shared accelerator at %LOCALAPPDATA%/espack/ESB64Native_v1.dll
+ * (materialized by any accel-carrying bundle) for native payload decode; absent -> JSX lane.
  */
 var ESPACK = (function () {
   var PAYLOADS = __PAYLOADS__;
@@ -17,6 +19,13 @@ var ESPACK = (function () {
   var ACCEL_B64 = "__ACCEL_B64__";
   var ACCEL_DIR_OVERRIDE = "__ACCEL_DIR__";
   var ESPAK_VERSION = "__ESPAK_VERSION__";
+
+  /* Shared-accel discovery (accel-less bundles): the canonical shared
+     accelerator that every accel-carrying bundle materializes once per
+     system at %LOCALAPPDATA%/espack/. An accel-less bundle reuses it for
+     native payload decode instead of the JSX lane. */
+  var SHARED_ACCEL_NAME = "ESB64Native";
+  var SHARED_ACCEL_VERSION = "1";
 
   var state = { mode: "es3", lib: null, lastError: "", extracted: {}, accelReady: false, accelLib: null, accelExtractMs: -1, nativeExtractMs: -1, payloadExtractMs: -1, loadMs: -1 };
 
@@ -48,7 +57,11 @@ __ESB64_RUNTIME__
 
   function payloadPath(i) { return pathJoin(cacheDir(), PAYLOADS[i].fileName); }
   function accelFileName() { return ACCEL_NAME + "_v" + ACCEL_VERSION + ".dll"; }
-  function accelPath() { return pathJoin(accelDir(), accelFileName()); }
+  function sharedAccelPath() { return pathJoin(accelDir(), SHARED_ACCEL_NAME + "_v" + SHARED_ACCEL_VERSION + ".dll"); }
+  function accelPath() {
+    if (hasAccel()) return pathJoin(accelDir(), accelFileName());
+    return sharedAccelPath();
+  }
   function hasAccel() { return ACCEL_LEN > 0; }
 
   function ensureDir(fsPath) {
@@ -152,11 +165,55 @@ __ESB64_RUNTIME__
   }
 
   function loadAccelLib() {
-    if (!hasAccel()) return false;
-    if (!extractAccel()) return false;
+    if (hasAccel()) {
+      if (extractAccel()) {
+        var fsPath = null;
+        try { fsPath = new File(accelPath()).fsName; } catch (e2) { fsPath = accelPath(); }
+        var cached = cachedLib(accelPath());
+        if (cached) {
+          state.accelLib = cached;
+          state.accelReady = true;
+          return true;
+        }
+        try {
+          var lib = new ExternalObject("lib:" + fsPath);
+          cacheLib(accelPath(), lib);
+          state.accelLib = lib;
+          state.accelReady = true;
+          return true;
+        } catch (e3) {
+          state.lastError = "ESPAK: accelerator load failed: " + String(e3) + "; payloads will use the JSX lane";
+          return false;
+        }
+      }
+      /* embedded accel extraction failed (e.g. read-only cache): fall back to
+         the shared accelerator already on the system, if any */
+      return loadSharedAccel();
+    }
+    /* accel-less bundle: discover the shared accelerator another bundle
+       already materialized on this system and reuse it for native decode */
+    return loadSharedAccel();
+  }
+
+  /* Accel-less bundle: reuse the shared accelerator at the canonical path
+     (%LOCALAPPDATA%/espack/ESB64Native_v1.dll). Fail-open: a missing file, a
+     load failure, or a non-accelerator DLL at that path all keep the JSX lane
+     with the reason surfaced. */
+  function loadSharedAccel() {
+    var p = sharedAccelPath();
+    try {
+      var f = new File(p);
+      if (!f.exists || f.length === 0) {
+        state.lastError = "ESPAK: shared accelerator not found at " + p + "; payloads will use the JSX lane";
+        return false;
+      }
+    } catch (e) {
+      state.lastError = "ESPAK: shared accelerator discovery failed: " + String(e) + "; payloads will use the JSX lane";
+      return false;
+    }
     var fsPath = null;
-    try { fsPath = new File(accelPath()).fsName; } catch (e2) { fsPath = accelPath(); }
-    var cached = cachedLib(accelPath());
+    try { fsPath = new File(p).fsName; } catch (e2) { fsPath = p; }
+    var cached = cachedLib(p);
     if (cached) {
       state.accelLib = cached;
       state.accelReady = true;
@@ -164,12 +221,16 @@ __ESB64_RUNTIME__
     }
     try {
       var lib = new ExternalObject("lib:" + fsPath);
-      cacheLib(accelPath(), lib);
+      if (typeof lib.b64decodeToFile !== "function") {
+        state.lastError = "ESPAK: shared accelerator at " + p + " is not the ESB64Native accelerator; payloads will use the JSX lane";
+        return false;
+      }
+      cacheLib(p, lib);
       state.accelLib = lib;
       state.accelReady = true;
       return true;
     } catch (e3) {
-      state.lastError = "ESPAK: accelerator load failed: " + String(e3) + "; payloads will use the JSX lane";
+      state.lastError = "ESPAK: shared accelerator load failed: " + String(e3) + "; payloads will use the JSX lane";
       return false;
     }
   }

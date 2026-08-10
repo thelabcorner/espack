@@ -16,6 +16,7 @@ import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, statSync } 
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from '../espack-build.mjs';
+import { merge } from '../espack-merge.mjs';
 
 var ROOT = dirname(fileURLToPath(import.meta.url));
 var SCRIPTS = process.env.ESPAK_DEV_SCRIPTS || 'C:/Program Files/Adobe/Adobe Illustrator 2026/Presets/en_US/Scripts';
@@ -61,6 +62,75 @@ function evalCode(code) {
 function evalSmoke(bundlePath) {
   var env = runTool(['eval', '--code',
     '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return ' + SMOKE]);
+  if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
+  return env.result;
+}
+
+// Multi-payload smoke: load(0) + load-by-name, distinct libs, unknown-name
+// rejection. Used atomically with the bundle eval (same race-free rationale
+// as evalSmoke).
+var SMOKE_MULTI = '(function () {' +
+  '  var out = { ok: false, error: null };' +
+  '  try {' +
+  '    var ESP = $.global.ESPAK;' +
+  '    if (!ESP) { out.error = "ESPAK not installed on $.global"; return out; }' +
+  '    out.payloads = ESP.config.payloads.length;' +
+  '    var l0 = ESP.load(0);' +
+  '    var lA = ESP.load("LibA");' +
+  '    var lB = ESP.load("LibB");' +
+  '    out.ok0 = l0.ok; out.okA = lA.ok; out.okB = lB.ok;' +
+  '    out.modeA = lA.mode; out.modeB = lB.mode;' +
+  '    out.sameLib = (lA.lib === l0.lib);' +
+  '    out.distinct = (lA.lib !== lB.lib);' +
+  '    out.b64encA = String(lA.lib.b64encode("hello"));' +
+  '    out.b64encB = String(lB.lib.b64encode("hello"));' +
+  '    var bad = ESP.load("Nope");' +
+  '    out.badOk = bad.ok;' +
+  '    out.ok = l0.ok && lA.ok && lB.ok && !bad.ok;' +
+  '  } catch (e) { out.error = String(e); }' +
+  '  return out;' +
+  '}());';
+
+function evalMulti(bundlePath) {
+  var env = runTool(['eval', '--code',
+    '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return ' + SMOKE_MULTI]);
+  if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
+  return env.result;
+}
+
+// Merged-bundle smoke: load both payloads by name, report extraction timing.
+var SMOKE_MERGED = '(function () {' +
+  '  var out = { ok: false, error: null };' +
+  '  try {' +
+  '    var ESP = $.global.ESPAK;' +
+  '    if (!ESP) { out.error = "ESPAK not installed on $.global"; return out; }' +
+  '    out.bundleName = ESP.config.bundleName;' +
+  '    out.payloads = ESP.config.payloads.length;' +
+  '    out.accelReady = ESP.accelReady();' +
+  '    var lA = ESP.load("LibA");' +
+  '    var lB = ESP.load("LibB");' +
+  '    out.okA = lA.ok; out.okB = lB.ok;' +
+  '    out.modeA = lA.mode; out.modeB = lB.mode;' +
+  '    out.extractMs = ESP.extractMs();' +
+  '    out.accelExtractMs = ESP.accelExtractMs();' +
+  '    out.b64encA = String(lA.lib.b64encode("hello"));' +
+  '    out.b64encB = String(lB.lib.b64encode("hello"));' +
+  '    out.ok = lA.ok && lB.ok;' +
+  '  } catch (e) { out.error = String(e); }' +
+  '  return out;' +
+  '}());';
+
+function evalMerged(bundlePath) {
+  var env = runTool(['eval', '--code',
+    '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return ' + SMOKE_MERGED]);
+  if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
+  return env.result;
+}
+
+// Facade-ordering probe: eval a bundle, report which ESPAK facade is active.
+function evalConfig(bundlePath) {
+  var env = runTool(['eval', '--code',
+    '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return { bundleName: $.global.ESPAK.config.bundleName, payloads: $.global.ESPAK.config.payloads.length };']);
   if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
   return env.result;
 }
@@ -115,6 +185,17 @@ function killAllAutomation() {
     '$p = Get-Process -Name Illustrator -ErrorAction SilentlyContinue; if ($p) { $p | Stop-Process -Force }; exit 0'],
     { timeout: 30000 });
 }
+// Stop-Process -Force is async w.r.t. file-lock release: rmSync immediately
+// after can hit still-locked DLLs. Retry with a short sleep so end-of-run
+// cleanup actually removes the cache dirs (start-of-run cleanup runs after
+// launchFresh and is reliable; this makes the end cleanup reliable too).
+function rmRetry(p) {
+  for (var i = 0; i < 5; i++) {
+    try { rmSync(p, { recursive: true, force: true }); return; } catch (e) {
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400); } catch (e2) {}
+    }
+  }
+}
 function launchFresh() {
   var env = runTool(['status', '--launch'], 90000);
   if (!env.ok) throw new Error('instance launch failed: ' + JSON.stringify(env).slice(0, 1000));
@@ -129,7 +210,7 @@ check('instance A fresh (' + instA.Version + ', ' + instA.DocumentsCount + ' doc
 
 if (existsSync(CACHE)) rmSync(CACHE, { recursive: true, force: true });
 if (existsSync(SHARED_ACCEL_DIR)) rmSync(SHARED_ACCEL_DIR, { recursive: true, force: true });
-['espack-e2e-lib1', 'espack-e2e-lib2'].forEach(function (d) {
+['espack-e2e-lib1', 'espack-e2e-lib2', 'espack-e2e-multi', 'espack-e2e-mergeA', 'espack-e2e-mergeB'].forEach(function (d) {
   try { rmSync(join(process.env.LOCALAPPDATA, d), { recursive: true, force: true }); } catch (e) {}
 });
 try { if (existsSync(BLOCKER)) rmSync(BLOCKER); } catch (e) {}
@@ -228,13 +309,77 @@ check('lib2: accel file untouched', statSync(join(SHARED_ACCEL_DIR, 'ESB64Native
 check('lib2: byte-exact', readFileSync(join(process.env.LOCALAPPDATA, 'espack-e2e-lib2', 'ESB64Native_v1.dll')).equals(dllBytes));
 console.log('      lib1 payloadExtractMs=' + sl1.extractMs + ' us (' + (sl1.extractMs / 1000).toFixed(1) + ' ms)  lib2 payloadExtractMs=' + sl2.extractMs + ' us (' + (sl2.extractMs / 1000).toFixed(1) + ' ms)');
 
+// ---- multi-payload bundle: load by index and name ------------------------------
+console.log('E2E: multi-payload bundle (load by index and name)...');
+var libA = join(DIST, 'LibA.dll');
+var libB = join(DIST, 'LibB.dll');
+writeFileSync(libA, dllBytes);
+writeFileSync(libB, dllBytes);
+var multiBundle = build({ embed: [libA, libB], out: join(DIST, 'espack-e2e-multi.jsx'), name: 'espack-e2e-multi', dllVersion: '1' });
+var sm = evalMulti(multiBundle.outPath);
+check('multi: bundle evals, 2 payloads', sm.ok === true && sm.payloads === 2, sm.error);
+check('multi: load(0) + load-by-name all native', sm.ok0 === true && sm.okA === true && sm.okB === true && sm.modeA === 'native' && sm.modeB === 'native', JSON.stringify(sm));
+check('multi: load-by-name resolves to index 0 (same lib)', sm.sameLib === true, 'sameLib=' + sm.sameLib);
+check('multi: distinct payloads -> distinct libs', sm.distinct === true, 'distinct=' + sm.distinct);
+check('multi: unknown payload name rejected', sm.badOk === false, 'badOk=' + sm.badOk);
+check('multi: native b64 vectors both payloads', sm.b64encA === 'aGVsbG8=' && sm.b64encB === 'aGVsbG8=', JSON.stringify({ a: sm.b64encA, b: sm.b64encB }));
+check('multi: byte-exact both payloads', readFileSync(join(process.env.LOCALAPPDATA, 'espack-e2e-multi', 'LibA_v1.dll')).equals(dllBytes) && readFileSync(join(process.env.LOCALAPPDATA, 'espack-e2e-multi', 'LibB_v1.dll')).equals(dllBytes));
+
+// ---- merged bundle: accel dedupe, cache migration, facade ordering -------------
+console.log('E2E: merged bundle (manifest merge)...');
+var mA = join(DIST, 'espack-e2e-mergeA.json');
+var mB = join(DIST, 'espack-e2e-mergeB.json');
+var bundleA = build({ embed: libA, out: join(DIST, 'espack-e2e-mergeA.jsx'), name: 'espack-e2e-mergeA', dllVersion: '1', manifestOut: mA });
+var bundleB = build({ embed: libB, out: join(DIST, 'espack-e2e-mergeB.jsx'), name: 'espack-e2e-mergeB', dllVersion: '1', manifestOut: mB });
+var merged = merge({ manifests: [mA, mB], out: join(DIST, 'espack-e2e-merged.jsx') });
+check('merge: 2 payloads, 1 accel', merged.payloads.length === 2 && !!merged.accel, JSON.stringify({ n: merged.payloads.length, accel: !!merged.accel }));
+check('merge: one accel literal in merged text (dedupe)', (merged.text.match(/var ACCEL_B64 = /g) || []).length === 1, 'accel literal count');
+check('merge: one PAYLOADS literal, bundle name = first manifest', (merged.text.match(/var PAYLOADS = /g) || []).length === 1 && merged.bundleName === 'espack-e2e-mergeA', merged.bundleName);
+var mergeADir = join(process.env.LOCALAPPDATA, 'espack-e2e-mergeA');
+var mergeBDir = join(process.env.LOCALAPPDATA, 'espack-e2e-mergeB');
+
+// facade ordering: eval A, then B, then merged -> the LAST eval wins. evalSmoke
+// also LOADS payload 0, so A's payload lands in %LOCALAPPDATA%/espack-e2e-mergeA
+// (its own dir = the merged bundle's dir, since the merged name defaults to the
+// first manifest) and B's payload lands in %LOCALAPPDATA%/espack-e2e-mergeB.
+var smA = evalSmoke(bundleA.outPath);
+check('facade: A active after A eval', smA.config.bundleName === 'espack-e2e-mergeA' && smA.config.payloads.length === 1, JSON.stringify(smA.config));
+check('migration: A payload extracted into its own dir', smA.isExtractedAfter === true && existsSync(join(mergeADir, 'LibA_v1.dll')));
+var smB = evalSmoke(bundleB.outPath);
+check('facade: B active after B eval (last-wins)', smB.config.bundleName === 'espack-e2e-mergeB' && smB.config.payloads.length === 1, JSON.stringify(smB.config));
+check('migration: B payload extracted into its own dir', smB.isExtractedAfter === true && existsSync(join(mergeBDir, 'LibB_v1.dll')));
+var smM1 = evalMerged(merged.outPath);
+check('facade: merged active after merged eval (last-wins)', smM1.bundleName === 'espack-e2e-mergeA' && smM1.payloads === 2, JSON.stringify({ bundleName: smM1.bundleName, payloads: smM1.payloads }));
+
+// cache migration: the merged bundle reuses the first manifest's cache dir
+// (espack-e2e-mergeA), so LibA is skip-extracted; LibB migrates from the mergeB
+// dir into the merged dir; the old mergeB copy stays stale but harmless (merged
+// GC is scoped to the merged cache dir only).
+check('merged: both payloads native via the single shared accel', smM1.ok === true && smM1.okA === true && smM1.okB === true && smM1.modeA === 'native' && smM1.modeB === 'native', smM1.error);
+check('merged: accel reused, not re-extracted (dedupe)', smM1.accelExtractMs === -1, 'accelExtractMs=' + smM1.accelExtractMs);
+check('merged: LibB extracted into the merged dir (migration)', existsSync(join(mergeADir, 'LibB_v1.dll')));
+check('merged: byte-exact both payloads in merged dir', readFileSync(join(mergeADir, 'LibA_v1.dll')).equals(dllBytes) && readFileSync(join(mergeADir, 'LibB_v1.dll')).equals(dllBytes));
+check('merged: old mergeB copy stale but harmless', existsSync(join(mergeBDir, 'LibB_v1.dll')), 'mergeB file removed by merged GC?');
+check('merged: native b64 vectors both payloads', smM1.b64encA === 'aGVsbG8=' && smM1.b64encB === 'aGVsbG8=', JSON.stringify({ a: smM1.b64encA, b: smM1.b64encB }));
+var mergedLibAMtime = statSync(join(mergeADir, 'LibA_v1.dll')).mtimeMs;
+var mergedLibBMtime = statSync(join(mergeADir, 'LibB_v1.dll')).mtimeMs;
+var smM2 = evalMerged(merged.outPath);
+check('merged re-run: skip-extract (extractMs -1)', smM2.ok === true && smM2.extractMs === -1, 'extractMs=' + smM2.extractMs);
+check('merged re-run: files untouched (mtime unchanged)', statSync(join(mergeADir, 'LibA_v1.dll')).mtimeMs === mergedLibAMtime && statSync(join(mergeADir, 'LibB_v1.dll')).mtimeMs === mergedLibBMtime, 'mtime changed');
+var cfgM = evalConfig(merged.outPath);
+check('facade: merged still active after re-eval (last-wins)', cfgM.bundleName === 'espack-e2e-mergeA' && cfgM.payloads === 2, JSON.stringify(cfgM));
+console.log('      merged extractMs=' + smM1.extractMs + ' us (' + (smM1.extractMs / 1000).toFixed(1) + ' ms)  re-run extractMs=' + smM2.extractMs + ' us');
+
 // ---- cleanup -------------------------------------------------------------------
 console.log('E2E: closing instance B...');
 killAllAutomation();
-try { rmSync(CACHE, { recursive: true, force: true }); } catch (e) {}
-try { rmSync(SHARED_ACCEL_DIR, { recursive: true, force: true }); } catch (e) {}
-try { rmSync(join(process.env.LOCALAPPDATA, 'espack-e2e-lib1'), { recursive: true, force: true }); } catch (e) {}
-try { rmSync(join(process.env.LOCALAPPDATA, 'espack-e2e-lib2'), { recursive: true, force: true }); } catch (e) {}
+rmRetry(CACHE);
+rmRetry(SHARED_ACCEL_DIR);
+rmRetry(join(process.env.LOCALAPPDATA, 'espack-e2e-lib1'));
+rmRetry(join(process.env.LOCALAPPDATA, 'espack-e2e-lib2'));
+rmRetry(join(process.env.LOCALAPPDATA, 'espack-e2e-multi'));
+rmRetry(join(process.env.LOCALAPPDATA, 'espack-e2e-mergeA'));
+rmRetry(join(process.env.LOCALAPPDATA, 'espack-e2e-mergeB'));
 try { rmSync(BLOCKER); } catch (e) {}
 
 console.log('\nE2E: ' + (failures ? failures + ' failure(s)' : 'ALL CHECKS PASSED'));

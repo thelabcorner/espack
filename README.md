@@ -7,7 +7,7 @@
 ### The build-time packer + ES3 self-extracting loader that ships ExternalObject DLLs inside a single `.jsx` for Adobe Illustrator, InDesign, Photoshop & any ExtendScript host
 
 [![Parity: byte-exact native/ES3](https://img.shields.io/badge/parity-byte--exact%20native%2FES3-success)](#performance)
-[![Tests: 28 Node + 50%2B live](https://img.shields.io/badge/tests-28%20Node%20%2B%2050%2B%20live-purple)](#validation)
+[![Tests: 33 Node + 50%2B live](https://img.shields.io/badge/tests-33%20Node%20%2B%2050%2B%20live-purple)](#validation)
 [![Native: x64 Windows](https://img.shields.io/badge/native-x64%20Windows-blue)](#compatibility)
 [![Adobe: Creative Suite](https://img.shields.io/badge/Adobe%20-Creative%20Suite-red?logo=adobe&logoColor=white)](https://extendscript.docsforadobe.dev/)
 [![Engine](https://img.shields.io/badge/ExtendScript-ES3-green)](#compatibility)
@@ -51,6 +51,8 @@ ExternalObject requires a **file path** — there is no in-memory DLL load. Ever
 - **n payload DLLs** (`--embed`, repeatable; each `name_v<version>.dll` in the per-bundle cache dir `%LOCALAPPDATA%\<bundle-name>\`). Every payload is decoded **by the accelerator** (`b64decodeToFile`: native decode written straight to disk — NUL-safe, no string channel), so payload extraction is microseconds instead of ~140 ms of JSX-lane decoding.
 
 Runtime order: start in ES3 mode → the inlined lane unpacks the accelerator (only if it is not already on the system) → the accelerator natively unpacks every payload → all DLLs load via `ExternalObject`. If the accelerator is unavailable (read-only cache, locked host), payloads fall back to the JSX lane transparently with the reason surfaced on `ESPAK.lastError()`.
+
+**Accel-less bundles still get the native lane when the shared accelerator is already on the system.** A bundle built with `--no-accel` discovers the canonical shared accelerator at `%LOCALAPPDATA%\espack\ESB64Native_v1.dll` (the exact path every accel-carrying bundle materializes) and reuses it for native payload decode — no composition change needed. If the file is absent, cannot be loaded, or is not the ESB64Native accelerator (no `b64decodeToFile`), payloads fall back to the JSX lane with the reason surfaced. The same fallback applies when an *embedded* accelerator cannot be extracted (e.g. read-only cache) but the shared one is already on disk. This is what makes merged/accel-less bundles fast on machines that have run any accel-carrying bundle.
 
 ---
 
@@ -125,7 +127,7 @@ valid `{"a":1}`). Fixed in `eson/src/parse.ts` (NUL texts never memoized).
 **How it works, in three steps:**
 
 1. Open the [Releases page](https://github.com/thelabcorner/espack/releases).
-2. Pick the **latest stable** tag (top of the list — today that is `v0.2.0`).
+2. Pick the **latest stable** tag (top of the list — today that is `v0.3.0`).
 3. Download the asset that matches your use case:
 
 | You are... | Take this release | And this asset |
@@ -160,6 +162,71 @@ Illustrator/ExtendScript host (File > Scripts, `$.evalFile`, or
 COM/automation `eval --file`); on first eval it materializes the shared
 accelerator (once per system) and the payload DLLs (once per bundle), then
 loads them via `ExternalObject`.
+
+---
+
+## Composition & merge (manifest-assisted)
+
+ESPAK composes several bundles into ONE at build time — the model the family
+uses to ship eson + esarr + arcfit as a single composed file with one loader,
+one shared accelerator, and N payloads.
+
+### The manifest contract (schema v1)
+
+`espack-build.mjs --manifest-out <path>` emits a deterministic sidecar
+manifest (fixed key order, no machine paths):
+
+```json
+{
+  "format": "espack-manifest",
+  "version": 1,
+  "bundleName": "eson",
+  "cacheDir": "",
+  "chunkSize": 24576,
+  "accel": { "name": "ESB64Native", "version": "1", "len": 9728, "b64": "...", "fileName": "ESB64Native_v1.dll" },
+  "payloads": [ { "name": "ESONJson", "version": "1", "len": 103424, "b64": "...", "fileName": "ESONJson_v1.dll" } ]
+}
+```
+
+`accel` is `null` for `--no-accel` bundles. The manifest is the merge input;
+it is never loaded at runtime.
+
+### Merging
+
+`espack-merge.mjs --merge <m1.json> <m2.json> ... --out <bundle.jsx>` reads
+the manifests and re-renders ONE loader with ONE shared accelerator and N
+payloads. Merge happens **pre-minify/pre-obfuscate** — the merged bundle is
+the normal deterministic output, so minified/obfuscated variants are produced
+by the same downstream pipeline as any other bundle. Collision policy (hard
+errors, not warnings):
+
+- same payload name+version+same b64 → dedupe (keep one)
+- same payload name+version+different b64 → HARD ERROR
+- same payload name, different version → keep the higher integer version
+  (non-integer versions → HARD ERROR)
+- accel: all manifests' accel must be identical (name+version+len+b64) or
+  HARD ERROR; `null` accel is allowed (merged bundle accel-less → warn — the
+  loader still discovers the shared accelerator on the system)
+- merged bundle name defaults to the FIRST manifest's bundleName; its cache
+  dir is reused, so payloads already extracted there are skipped
+
+### Composition model
+
+Four layers:
+
+1. **Runtime** — one loader per composed file (the emitted `ESPAK` facade).
+2. **Tooling** — `espack-build --manifest-out` + `espack-merge`.
+3. **Consumers** — manifest + loader-free facade artifacts; adapters load by
+   payload NAME (`ESONJson` / `ESARRArray` / `ArcFit_IPC`), never `load(0)`.
+4. **Composer** — the build script (e.g. arcfit `build.mjs`) runs
+   `espack-merge`, then appends the consumer facades.
+
+Facade ordering: `$.global.ESPAK` is **last-wins** — the merged bundle must be
+evaluated LAST in the injection order so its facade (all payloads) is the
+active one. Cache migration: payloads move from `%LOCALAPPDATA%\<old-bundle>`
+to the merged dir; old extracted files become stale but harmless (GC is
+scoped per DLL name inside the merged cache dir only, so the merged bundle
+never deletes the old bundles' files).
 
 ---
 
@@ -280,8 +347,8 @@ throws to the consumer.
 
 | Check | Command | Result |
 |---|---|---|
-| Packer units + loader logic in a vm sandbox (stubbed `File`/`Folder`/`ExternalObject`/`$`) — 1+n sharing, chunk-boundary mirror, failure paths | `npm test` | 28/28 + vendor-sync drift guard |
-| Live end-to-end on Illustrator via the COM tool — 1+n extraction, sharing, skip-extract, version bumps, GC across sessions, failure paths | `npm run e2e` | 50+ live checks (requires COM tool + an automation instance) |
+| Packer units + loader logic in a vm sandbox (stubbed `File`/`Folder`/`ExternalObject`/`$`) — 1+n sharing, shared-accel discovery, chunk-boundary mirror, failure paths | `npm test` | 33/33 + vendor-sync drift guard |
+| Live end-to-end on Illustrator via the COM tool — 1+n extraction, sharing, skip-extract, version bumps, GC across sessions, failure paths, multi-payload load-by-name, merged-bundle accel dedupe, cache migration, facade ordering | `npm run e2e` | 60+ live checks (requires COM tool + an automation instance) |
 | Vendored esb64 artifacts match upstream (runtime lane + accelerator) | `npm test` (vendor-sync guard) | drift-guarded |
 
 The e2e suite runs: fresh system → v1 (accel JSX extraction + native payload
@@ -412,8 +479,8 @@ Measured on Illustrator 30.6.0 (ExtendScript 4.5.6) — see
 ```
 npm install              # devDeps only (esbuild + typescript for tests/build)
 npm run build            # bundles src/loader.jsx -> dist bundles via espack-build.mjs
-npm test                 # 28 Node tests (packer + vm loader logic incl. 1+n sharing +
-                         #   chunk mirror) + vendor-sync drift guard
+npm test                 # 33 Node tests (packer + vm loader logic incl. 1+n sharing +
+                         #   shared-accel discovery + chunk mirror) + vendor-sync drift guard
 npm run e2e              # 50+ live checks on Illustrator (requires COM tool + an
                          #   automation instance; kills stale automation instances first)
 npm run vendor-sync      # refresh vendor/ from the sibling esb64 build

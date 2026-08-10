@@ -259,12 +259,14 @@ function makeSandbox(root, opts) {
     this.spec = spec;
     this.getVersion = function () { return 'stub 1.0.0'; };
     this.add = function (a, b) { return a + b; };
-    this.b64decodeToFile = function (b64, path) {
-      if (opts.accelNativeFails) throw new Error('stub native decode failure');
-      var bytes = Buffer.from(b64, 'base64');
-      fs.writeFileSync(norm(path), bytes);
-      return bytes.length;
-    };
+    if (!opts.externalNoDecode) {
+      this.b64decodeToFile = function (b64, path) {
+        if (opts.accelNativeFails) throw new Error('stub native decode failure');
+        var bytes = Buffer.from(b64, 'base64');
+        fs.writeFileSync(norm(path), bytes);
+        return bytes.length;
+      };
+    }
   }
   ExternalCtor.search = function () { return 'stub-search-result'; };
   var sandbox = {};
@@ -306,7 +308,7 @@ test('loader: extract writes byte-exact DLL, load reaches native, attach swaps',
   runBundle(sandbox, r);
   var ESPAK = sandbox.ESPAK;
   assert.ok(ESPAK, 'ESPAK installed on $.global');
-  assert.strictEqual(ESPAK.version, '0.2.0');
+  assert.strictEqual(ESPAK.version, '0.3.0');
   assert.strictEqual(ESPAK.config.payloads.length, 1);
   assert.strictEqual(ESPAK.config.payloads[0].fileName, 'FakeDll_v1.dll');
   assert.strictEqual(ESPAK.config.accel, null, 'no accel in bundle');
@@ -604,6 +606,108 @@ test('loader: multi-payload bundle - load by index and name', function () {
   var bad = ESPAK.load('Nope');
   assert.strictEqual(bad.ok, false);
   assert.ok(/unknown payload/.test(bad.error));
+});
+
+// ---- shared-accel discovery (accel-less bundles) ------------------------------
+
+test('loader: accel-less bundle discovers the shared accelerator and decodes natively', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  // the shared accel is already on the system (materialized by another bundle)
+  var sharedDir = join(root, 'espack');
+  mkdirSync(sharedDir, { recursive: true });
+  writeFileSync(join(sharedDir, 'ESB64Native_v1.dll'), DLL_2);
+  var r = buildOnce({ dllName: 'FakeDll.dll', name: 'bundleD1', dllVersion: '1' }); // accel: false
+  assert.strictEqual(r.accel, null, 'bundle is accel-less');
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  runBundle(sandbox, r);
+  var ESPAK = sandbox.ESPAK;
+  assert.strictEqual(ESPAK.config.accel, null, 'config still reports no embedded accel');
+  var e = ESPAK.extract(0);
+  assert.strictEqual(e.ok, true);
+  assert.strictEqual(e.lane, 'native', 'discovered accel -> native lane');
+  assert.ok(ESPAK.accelReady(), 'discovered accel loaded');
+  assert.strictEqual(ESPAK.accelExtractMs(), -1, 'nothing extracted (discovery only)');
+  assert.ok(ESPAK.nativeExtractMs() >= 0, 'native extraction measured');
+  var extracted = readFileSync(join(root, 'bundleD1', 'FakeDll_v1.dll'));
+  assert.ok(extracted.equals(Buffer.from(r.payloads[0].b64, 'base64')), 'payload byte-exact');
+  var l = ESPAK.load(0);
+  assert.strictEqual(l.ok, true);
+  assert.strictEqual(l.mode, 'native');
+});
+
+test('loader: accel-less bundle reuses the accel another bundle materialized (1+n discovery)', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var accelPath = writeDll(mkdtempSync(join(TMP, 'acc-')), 'ESB64Native.dll', DLL_2);
+  // bundle A carries the accel and materializes it on the system
+  var rA = buildOnce({ dllName: 'LibA.dll', name: 'bundleA', accel: true, accelPath: accelPath, bytes: DLL_1 });
+  var sandboxA = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  runBundle(sandboxA, rA);
+  var la = sandboxA.ESPAK.load(0);
+  assert.strictEqual(la.ok, true);
+  var accelFile = join(root, 'espack', 'ESB64Native_v1.dll');
+  assert.ok(existsSync(accelFile), 'A materialized the shared accel');
+  var accelMtime = statSync(accelFile).mtimeMs;
+  // bundle B is accel-less but discovers A's accel
+  var rB = buildOnce({ dllName: 'LibB.dll', name: 'bundleB', bytes: DLL_3 });
+  var sandboxB = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  runBundle(sandboxB, rB);
+  var B = sandboxB.ESPAK;
+  var lb = B.load(0);
+  assert.strictEqual(lb.ok, true);
+  assert.strictEqual(lb.mode, 'native', 'B decoded natively via the discovered accel');
+  assert.ok(B.accelReady(), 'B discovered the shared accel');
+  assert.strictEqual(B.accelExtractMs(), -1, 'B did not extract anything');
+  assert.strictEqual(statSync(accelFile).mtimeMs, accelMtime, 'accel file untouched by B');
+  assert.ok(readFileSync(join(root, 'bundleB', 'LibB_v1.dll')).equals(Buffer.from(rB.payloads[0].b64, 'base64')), 'B payload byte-exact');
+});
+
+test('loader: accel-less bundle without a shared accel falls back to the JSX lane', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var r = buildOnce({ dllName: 'FakeDll.dll', name: 'bundleD3', dllVersion: '1' });
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  runBundle(sandbox, r);
+  var ESPAK = sandbox.ESPAK;
+  var e = ESPAK.extract(0);
+  assert.strictEqual(e.ok, true);
+  assert.strictEqual(e.lane, 'jsx', 'no shared accel -> JSX lane');
+  assert.strictEqual(ESPAK.accelReady(), false);
+  assert.ok(/shared accelerator not found/.test(ESPAK.lastError()), 'reason surfaced: ' + ESPAK.lastError());
+  var extracted = readFileSync(join(root, 'bundleD3', 'FakeDll_v1.dll'));
+  assert.ok(extracted.equals(Buffer.from(r.payloads[0].b64, 'base64')), 'payload byte-exact via the JSX lane');
+});
+
+test('loader: shared-accel discovery rejects a non-accelerator DLL at the shared path', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var sharedDir = join(root, 'espack');
+  mkdirSync(sharedDir, { recursive: true });
+  writeFileSync(join(sharedDir, 'ESB64Native_v1.dll'), DLL_2); // exists, but the stub lacks b64decodeToFile
+  var r = buildOnce({ dllName: 'FakeDll.dll', name: 'bundleD4', dllVersion: '1' });
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root }, externalNoDecode: true });
+  runBundle(sandbox, r);
+  var ESPAK = sandbox.ESPAK;
+  var e = ESPAK.extract(0);
+  assert.strictEqual(e.ok, true);
+  assert.strictEqual(e.lane, 'jsx', 'non-accelerator DLL -> JSX lane');
+  assert.strictEqual(ESPAK.accelReady(), false);
+  assert.ok(/not the ESB64Native accelerator/.test(ESPAK.lastError()), 'reason surfaced: ' + ESPAK.lastError());
+});
+
+test('loader: embedded-accel extraction failure falls back to the shared accel on disk', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var sharedDir = join(root, 'espack');
+  mkdirSync(sharedDir, { recursive: true });
+  // different size than the embedded accel -> embedded extraction is attempted
+  writeFileSync(join(sharedDir, 'ESB64Native_v1.dll'), DLL_2);
+  var r = buildOnce({ dllName: 'FakeDll.dll', name: 'bundleD5', dllVersion: '1', accel: true, accelBytes: DLL_1 });
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root }, failOpen: true });
+  runBundle(sandbox, r);
+  var ESPAK = sandbox.ESPAK;
+  var e = ESPAK.extract(0);
+  assert.strictEqual(e.ok, true);
+  assert.strictEqual(e.lane, 'native', 'shared accel on disk -> native lane despite write failure');
+  assert.ok(ESPAK.accelReady(), 'shared accel loaded');
+  var extracted = readFileSync(join(root, 'bundleD5', 'FakeDll_v1.dll'));
+  assert.ok(extracted.equals(Buffer.from(r.payloads[0].b64, 'base64')), 'payload byte-exact');
 });
 
 run();
