@@ -53,8 +53,11 @@ HTTP transport for ExtendScript automation.
 **[ESPACK](https://github.com/thelabcorner/espack)**  
 Self-extracting ExternalObject bundles.
 
-**[ESOBF](https://github.com/thelabcorner/esobf)**  
-Obfuscation for shipped JSX bundles.
+**[ESMIN](https://github.com/thelabcorner/es-min)**  
+Minification for shipped JSX bundles.
+
+**ESOBF** <sub>coming soon</sub>  
+Obfuscation for hardened JSX distribution.
 
 </td>
 </tr>
