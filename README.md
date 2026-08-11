@@ -17,7 +17,50 @@
 
 ---
 
-> **From the same team: [ESON](https://github.com/thelabcorner/eson) — strict JSON for ExtendScript, [ESB64](https://github.com/thelabcorner/es-b64) — base64/UTF-8, ESARR — ES5 array methods, ESSTR — string trim, ESCHARS — native bulk byte ops, ESOBF — obfuscation, and [ArcFit.dev](https://arcfit.dev) — deterministic arc warp for Illustrator.**
+## Part Of The Same Toolkit
+
+> Production-grade ExtendScript infrastructure for Illustrator-era JavaScript engines.
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### Runtime Primitives
+
+**[ESON](https://github.com/thelabcorner/eson)**  
+Strict RFC 8259 JSON for ExtendScript.
+
+**[ESB64](https://github.com/thelabcorner/es-b64)**  
+Base64 and UTF-8 utilities.
+
+**[ESARR](https://github.com/thelabcorner/es-arr)**  
+ES5+ Array compatibility methods.
+
+**[ESSTR](https://github.com/thelabcorner/es-str)**  
+String whitespace and trim methods.
+
+**[ESCHARS](https://github.com/thelabcorner/es-chars)**  
+Native bulk byte operations.
+
+</td>
+<td width="50%" valign="top">
+
+### Build & Integration Tools
+
+**[ESHTTP](https://github.com/thelabcorner/es-http)**  
+HTTP transport for ExtendScript automation.
+
+**[ESPACK](https://github.com/thelabcorner/espack)**  
+Self-extracting ExternalObject bundles.
+
+**[ESOBF](https://github.com/thelabcorner/esobf)**  
+Obfuscation for shipped JSX bundles.
+
+</td>
+</tr>
+</table>
+
+Also from the same team: **[ArcFit.dev](https://arcfit.dev)**, deterministic arc warp for Illustrator.
 
 ---
 
