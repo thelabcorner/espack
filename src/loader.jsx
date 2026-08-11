@@ -25,7 +25,7 @@ var ESPACK = (function () {
      system at %LOCALAPPDATA%/espack/. An accel-less bundle reuses it for
      native payload decode instead of the JSX lane. */
   var SHARED_ACCEL_NAME = "ESB64Native";
-  var SHARED_ACCEL_VERSION = "1";
+  var SHARED_ACCEL_VERSION = "2";
 
   var state = { mode: "es3", lib: null, lastError: "", extracted: {}, accelReady: false, accelLib: null, accelExtractMs: -1, nativeExtractMs: -1, payloadExtractMs: -1, loadMs: -1 };
 

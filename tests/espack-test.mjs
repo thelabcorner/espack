@@ -718,7 +718,7 @@ test('loader: accel-less bundle discovers the shared accelerator and decodes nat
   // the shared accel is already on the system (materialized by another bundle)
   var sharedDir = join(root, 'espack');
   mkdirSync(sharedDir, { recursive: true });
-  writeFileSync(join(sharedDir, 'ESB64Native_v1.dll'), DLL_2);
+  writeFileSync(join(sharedDir, 'ESB64Native_v2.dll'), DLL_2);
   var r = buildOnce({ dllName: 'FakeDll.dll', name: 'bundleD1', dllVersion: '1' }); // accel: false
   assert.strictEqual(r.accel, null, 'bundle is accel-less');
   var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
@@ -742,12 +742,12 @@ test('loader: accel-less bundle reuses the accel another bundle materialized (1+
   var root = mkdtempSync(join(TMP, 'sandbox-'));
   var accelPath = writeDll(mkdtempSync(join(TMP, 'acc-')), 'ESB64Native.dll', DLL_2);
   // bundle A carries the accel and materializes it on the system
-  var rA = buildOnce({ dllName: 'LibA.dll', name: 'bundleA', accel: true, accelPath: accelPath, bytes: DLL_1 });
+  var rA = buildOnce({ dllName: 'LibA.dll', name: 'bundleA', accel: true, accelPath: accelPath, accelVersion: '2', bytes: DLL_1 });
   var sandboxA = makeSandbox(root, { env: { LOCALAPPDATA: root } });
   runBundle(sandboxA, rA);
   var la = sandboxA.ESPAK.load(0);
   assert.strictEqual(la.ok, true);
-  var accelFile = join(root, 'espack', 'ESB64Native_v1.dll');
+  var accelFile = join(root, 'espack', 'ESB64Native_v2.dll');
   assert.ok(existsSync(accelFile), 'A materialized the shared accel');
   var accelMtime = statSync(accelFile).mtimeMs;
   // bundle B is accel-less but discovers A's accel
@@ -783,7 +783,7 @@ test('loader: shared-accel discovery rejects a non-accelerator DLL at the shared
   var root = mkdtempSync(join(TMP, 'sandbox-'));
   var sharedDir = join(root, 'espack');
   mkdirSync(sharedDir, { recursive: true });
-  writeFileSync(join(sharedDir, 'ESB64Native_v1.dll'), DLL_2); // exists, but the stub lacks b64decodeToFile
+  writeFileSync(join(sharedDir, 'ESB64Native_v2.dll'), DLL_2); // exists, but the stub lacks b64decodeToFile
   var r = buildOnce({ dllName: 'FakeDll.dll', name: 'bundleD4', dllVersion: '1' });
   var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root }, externalNoDecode: true });
   runBundle(sandbox, r);
@@ -800,7 +800,7 @@ test('loader: embedded-accel extraction failure falls back to the shared accel o
   var sharedDir = join(root, 'espack');
   mkdirSync(sharedDir, { recursive: true });
   // different size than the embedded accel -> embedded extraction is attempted
-  writeFileSync(join(sharedDir, 'ESB64Native_v1.dll'), DLL_2);
+  writeFileSync(join(sharedDir, 'ESB64Native_v2.dll'), DLL_2);
   var r = buildOnce({ dllName: 'FakeDll.dll', name: 'bundleD5', dllVersion: '1', accel: true, accelBytes: DLL_1 });
   var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root }, failOpen: true });
   runBundle(sandbox, r);
