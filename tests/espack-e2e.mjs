@@ -17,15 +17,16 @@ import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from '../espack-build.mjs';
 import { merge } from '../espack-merge.mjs';
+import { createLegacyComToolV2Runner } from '../../extendscript-toolchain/src/comtool-v2-compat.mjs';
 
 var ROOT = dirname(fileURLToPath(import.meta.url));
-var SCRIPTS = process.env.ESPAK_DEV_SCRIPTS || 'C:/Program Files/Adobe/Adobe Illustrator 2026/Presets/en_US/Scripts';
 var DLL = join(ROOT, '..', 'vendor', 'ESB64Native.dll');
-var TOOL = process.env.ILLUSTRATOR_COM_TOOL || SCRIPTS + '/agent-skills/illustrator-com-automation-skill/comtool/ILLUSTRATOR_COM_TOOL.py';
 var DIST = join(ROOT, '..', 'dist');
 var CACHE = join(process.env.LOCALAPPDATA || '', 'espack-e2e-test');
 var BLOCKER = join(process.env.LOCALAPPDATA || '', 'espack-e2e-fail.txt');
 var SHARED_ACCEL_DIR = join(process.env.LOCALAPPDATA || '', 'espack');
+var COM = createLegacyComToolV2Runner();
+process.on('exit', function () { try { COM.close(); } catch (ignore) {} });
 
 var dllBytes = readFileSync(DLL);
 console.log('E2E: DLL ' + basename(DLL) + ' ' + dllBytes.length + ' bytes; cache ' + CACHE);
@@ -36,8 +37,7 @@ function check(name, cond, detail) {
   else { failures++; console.log('FAIL ' + name + (detail ? '  ' + detail : '')); }
 }
 function runTool(args, timeoutMs) {
-  var out = execFileSync('python', [TOOL].concat(args), { encoding: 'utf8', timeout: timeoutMs || 180000 });
-  return JSON.parse(out.trim());
+  return COM.run(args, { timeoutMs: timeoutMs || 180000 });
 }
 function evalFile(path) {
   // CLI contract: env.ok = tool success (script errors set env.ok=false);
@@ -75,6 +75,7 @@ var SMOKE_MULTI = '(function () {' +
   '    var ESP = $.global.ESPAK;' +
   '    if (!ESP) { out.error = "ESPAK not installed on $.global"; return out; }' +
   '    out.payloads = ESP.config.payloads.length;' +
+  '    out.payload0 = ESP.config.payloads.length ? ESP.config.payloads[0].name : null;' +
   '    var l0 = ESP.load(0);' +
   '    var lA = ESP.load("LibA");' +
   '    var lB = ESP.load("LibB");' +
@@ -106,6 +107,7 @@ var SMOKE_MERGED = '(function () {' +
   '    if (!ESP) { out.error = "ESPAK not installed on $.global"; return out; }' +
   '    out.bundleName = ESP.config.bundleName;' +
   '    out.payloads = ESP.config.payloads.length;' +
+  '    out.payload0 = ESP.config.payloads.length ? ESP.config.payloads[0].name : null;' +
   '    out.accelReady = ESP.accelReady();' +
   '    var lA = ESP.load("LibA");' +
   '    var lB = ESP.load("LibB");' +
@@ -127,10 +129,11 @@ function evalMerged(bundlePath) {
   return env.result;
 }
 
-// Facade-ordering probe: eval a bundle, report which ESPAK facade is active.
+// Shared-loader ordering probe: the first loader object stays global while
+// compatible later bundles front-register their payloads.
 function evalConfig(bundlePath) {
   var env = runTool(['eval', '--code',
-    '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return { bundleName: $.global.ESPAK.config.bundleName, payloads: $.global.ESPAK.config.payloads.length };']);
+    '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return { bundleName: $.global.ESPAK.config.bundleName, payloads: $.global.ESPAK.config.payloads.length, payload0: $.global.ESPAK.config.payloads.length ? $.global.ESPAK.config.payloads[0].name : null };']);
   if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
   return env.result;
 }
@@ -208,6 +211,11 @@ function buildBundle(version, extra) {
 }
 
 function killAllAutomation() {
+  // Release the current V2 target lease and owned RuntimeHost BEFORE killing
+  // Illustrator. The next status --launch call will discover the new strong
+  // target identity and acquire a fresh lease instead of retaining stale
+  // process/lease state across the cross-session GC test.
+  COM.reset();
   execFileSync('powershell.exe', ['-NoProfile', '-Command',
     '$p = Get-Process -Name Illustrator -ErrorAction SilentlyContinue; if ($p) { $p | Stop-Process -Force }; exit 0'],
     { timeout: 30000 });
@@ -283,9 +291,13 @@ check('v2: extracted', existsSync(extractedPath(2)));
 check('v2: v1 still present (locked by host)', existsSync(extractedPath(1)));
 console.log('      v2 extractMs=' + s2.extractMs + ' us (' + (s2.extractMs / 1000).toFixed(1) + ' ms)');
 
-// failure path: cache dir override points at an existing FILE
+// failure path: cache dir override points at an existing FILE. Use a distinct
+// payload identity so the shared registry's monotonic no-downgrade rule cannot
+// legitimately keep the already-registered ESB64Native v2 payload active.
 writeFileSync(BLOCKER, 'blocker');
-var failBundle = build({ embed: DLL, out: join(DIST, 'espack-e2e-fail.jsx'), name: 'espack-e2e-fail', dllVersion: '1', cacheDir: BLOCKER.replace(/\\/g, '/') });
+var failDll = join(DIST, 'FailLib.dll');
+writeFileSync(failDll, dllBytes);
+var failBundle = build({ embed: failDll, out: join(DIST, 'espack-e2e-fail.jsx'), name: 'espack-e2e-fail', dllVersion: '1', cacheDir: BLOCKER.replace(/\\/g, '/') });
 var sf = evalSmoke(failBundle.outPath);
 check('fail-path: load fails cleanly', sf.loadOk === false, JSON.stringify(sf));
 check('fail-path: stays es3', sf.mode === 'es3');
@@ -321,19 +333,23 @@ console.log('      v4 extractMs=' + s4.extractMs + ' us (' + (s4.extractMs / 100
 // ---- 1+n cross-bundle sharing on the fresh instance B -------------------------
 console.log('E2E: 1+n sharing scenario (lib1/lib2, shared accelerator)...');
 var accelMtime = statSync(join(SHARED_ACCEL_DIR, 'ESB64Native_v1.dll')).mtimeMs;
-var lib1 = build({ embed: DLL, out: join(DIST, 'espack-e2e-lib1.jsx'), name: 'espack-e2e-lib1', dllVersion: '1' });
+var lib1Dll = join(DIST, 'Lib1.dll');
+var lib2Dll = join(DIST, 'Lib2.dll');
+writeFileSync(lib1Dll, dllBytes);
+writeFileSync(lib2Dll, dllBytes);
+var lib1 = build({ embed: lib1Dll, out: join(DIST, 'espack-e2e-lib1.jsx'), name: 'espack-e2e-lib1', dllVersion: '1' });
 var sl1 = evalSmoke(lib1.outPath);
 check('lib1: native via shared accel', sl1.ok === true && sl1.mode === 'native', sl1.error);
 check('lib1: accel skipped (already on system)', sl1.accelExtractMs === -1, 'accelExtractMs=' + sl1.accelExtractMs);
 check('lib1: accel file untouched', statSync(join(SHARED_ACCEL_DIR, 'ESB64Native_v1.dll')).mtimeMs === accelMtime, 'mtime changed');
 check('lib1: payload native extraction', sl1.nativeExtractMs >= 0, String(sl1.nativeExtractMs));
-check('lib1: byte-exact', readFileSync(join(process.env.LOCALAPPDATA, 'espack-e2e-lib1', 'ESB64Native_v1.dll')).equals(dllBytes));
-var lib2 = build({ embed: DLL, out: join(DIST, 'espack-e2e-lib2.jsx'), name: 'espack-e2e-lib2', dllVersion: '1' });
+check('lib1: byte-exact', readFileSync(join(process.env.LOCALAPPDATA, 'espack-e2e-lib1', 'Lib1_v1.dll')).equals(dllBytes));
+var lib2 = build({ embed: lib2Dll, out: join(DIST, 'espack-e2e-lib2.jsx'), name: 'espack-e2e-lib2', dllVersion: '1' });
 var sl2 = evalSmoke(lib2.outPath);
 check('lib2: native via shared accel', sl2.ok === true && sl2.mode === 'native', sl2.error);
 check('lib2: accel skipped again', sl2.accelExtractMs === -1, 'accelExtractMs=' + sl2.accelExtractMs);
 check('lib2: accel file untouched', statSync(join(SHARED_ACCEL_DIR, 'ESB64Native_v1.dll')).mtimeMs === accelMtime, 'mtime changed');
-check('lib2: byte-exact', readFileSync(join(process.env.LOCALAPPDATA, 'espack-e2e-lib2', 'ESB64Native_v1.dll')).equals(dllBytes));
+check('lib2: byte-exact', readFileSync(join(process.env.LOCALAPPDATA, 'espack-e2e-lib2', 'Lib2_v1.dll')).equals(dllBytes));
 console.log('      lib1 payloadExtractMs=' + sl1.extractMs + ' us (' + (sl1.extractMs / 1000).toFixed(1) + ' ms)  lib2 payloadExtractMs=' + sl2.extractMs + ' us (' + (sl2.extractMs / 1000).toFixed(1) + ' ms)');
 
 // ---- multi-payload bundle: load by index and name ------------------------------
@@ -344,7 +360,7 @@ writeFileSync(libA, dllBytes);
 writeFileSync(libB, dllBytes);
 var multiBundle = build({ embed: [libA, libB], out: join(DIST, 'espack-e2e-multi.jsx'), name: 'espack-e2e-multi', dllVersion: '1' });
 var sm = evalMulti(multiBundle.outPath);
-check('multi: bundle evals, 2 payloads', sm.ok === true && sm.payloads === 2, sm.error);
+check('multi: bundle registers both payloads into shared loader', sm.ok === true && sm.payloads >= 2 && sm.payload0 === 'LibA', JSON.stringify({ payloads: sm.payloads, payload0: sm.payload0, error: sm.error }));
 check('multi: load(0) + load-by-name all native', sm.ok0 === true && sm.okA === true && sm.okB === true && sm.modeA === 'native' && sm.modeB === 'native', JSON.stringify(sm));
 check('multi: load-by-name resolves to index 0 (same lib)', sm.sameLib === true, 'sameLib=' + sm.sameLib);
 check('multi: distinct payloads -> distinct libs', sm.distinct === true, 'distinct=' + sm.distinct);
@@ -352,7 +368,7 @@ check('multi: unknown payload name rejected', sm.badOk === false, 'badOk=' + sm.
 check('multi: native b64 vectors both payloads', sm.b64encA === 'aGVsbG8=' && sm.b64encB === 'aGVsbG8=', JSON.stringify({ a: sm.b64encA, b: sm.b64encB }));
 check('multi: byte-exact both payloads', readFileSync(join(process.env.LOCALAPPDATA, 'espack-e2e-multi', 'LibA_v1.dll')).equals(dllBytes) && readFileSync(join(process.env.LOCALAPPDATA, 'espack-e2e-multi', 'LibB_v1.dll')).equals(dllBytes));
 
-// ---- merged bundle: accel dedupe, cache migration, facade ordering -------------
+// ---- merged bundle: accel dedupe, cache migration, shared-loader ordering -------
 console.log('E2E: merged bundle (manifest merge)...');
 var mA = join(DIST, 'espack-e2e-mergeA.json');
 var mB = join(DIST, 'espack-e2e-mergeB.json');
@@ -365,18 +381,17 @@ check('merge: one PAYLOADS literal, bundle name = first manifest', (merged.text.
 var mergeADir = join(process.env.LOCALAPPDATA, 'espack-e2e-mergeA');
 var mergeBDir = join(process.env.LOCALAPPDATA, 'espack-e2e-mergeB');
 
-// facade ordering: eval A, then B, then merged -> the LAST eval wins. evalSmoke
-// also LOADS payload 0, so A's payload lands in %LOCALAPPDATA%/espack-e2e-mergeA
-// (its own dir = the merged bundle's dir, since the merged name defaults to the
-// first manifest) and B's payload lands in %LOCALAPPDATA%/espack-e2e-mergeB.
+// The FIRST installed loader object remains $.global.ESPAK. Compatible later
+// bundles front-register their payloads, so the latest bundle's payload 0 is
+// what load(0) resolves to without replacing the loader object itself.
 var smA = evalSmoke(bundleA.outPath);
-check('facade: A active after A eval', smA.config.bundleName === 'espack-e2e-mergeA' && smA.config.payloads.length === 1, JSON.stringify(smA.config));
+check('shared loader: A front-registered after A eval', smA.config.payloads.length >= 1 && smA.config.payloads[0].name === 'LibA', JSON.stringify(smA.config));
 check('migration: A payload extracted into its own dir', smA.isExtractedAfter === true && existsSync(join(mergeADir, 'LibA_v1.dll')));
 var smB = evalSmoke(bundleB.outPath);
-check('facade: B active after B eval (last-wins)', smB.config.bundleName === 'espack-e2e-mergeB' && smB.config.payloads.length === 1, JSON.stringify(smB.config));
+check('shared loader: B front-registered after B eval', smB.config.payloads.length >= 1 && smB.config.payloads[0].name === 'LibB', JSON.stringify(smB.config));
 check('migration: B payload extracted into its own dir', smB.isExtractedAfter === true && existsSync(join(mergeBDir, 'LibB_v1.dll')));
 var smM1 = evalMerged(merged.outPath);
-check('facade: merged active after merged eval (last-wins)', smM1.bundleName === 'espack-e2e-mergeA' && smM1.payloads === 2, JSON.stringify({ bundleName: smM1.bundleName, payloads: smM1.payloads }));
+check('shared loader: merged bundle front-registers manifest payload 0', smM1.payloads >= 2 && smM1.payload0 === 'LibA', JSON.stringify({ bundleName: smM1.bundleName, payloads: smM1.payloads, payload0: smM1.payload0 }));
 
 // cache migration: the merged bundle reuses the first manifest's cache dir
 // (espack-e2e-mergeA), so LibA is skip-extracted; LibB migrates from the mergeB
@@ -394,7 +409,7 @@ var smM2 = evalMerged(merged.outPath);
 check('merged re-run: skip-extract (extractMs -1)', smM2.ok === true && smM2.extractMs === -1, 'extractMs=' + smM2.extractMs);
 check('merged re-run: files untouched (mtime unchanged)', statSync(join(mergeADir, 'LibA_v1.dll')).mtimeMs === mergedLibAMtime && statSync(join(mergeADir, 'LibB_v1.dll')).mtimeMs === mergedLibBMtime, 'mtime changed');
 var cfgM = evalConfig(merged.outPath);
-check('facade: merged still active after re-eval (last-wins)', cfgM.bundleName === 'espack-e2e-mergeA' && cfgM.payloads === 2, JSON.stringify(cfgM));
+check('shared loader: merged payload ordering stable after re-eval', cfgM.payloads >= 2 && cfgM.payload0 === 'LibA', JSON.stringify(cfgM));
 console.log('      merged extractMs=' + smM1.extractMs + ' us (' + (smM1.extractMs / 1000).toFixed(1) + ' ms)  re-run extractMs=' + smM2.extractMs + ' us');
 
 // ---- arbitrary-file payload (kind=file): byte-exact extract, load() rejects ----

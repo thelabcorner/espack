@@ -28,8 +28,107 @@ var ESPACK = (function () {
   var SHARED_ACCEL_VERSION = "2";
 
   var state = { mode: "es3", lib: null, lastError: "", extracted: {}, accelReady: false, accelLib: null, accelExtractMs: -1, nativeExtractMs: -1, payloadExtractMs: -1, loadMs: -1 };
+  /* Public config must track the live shared registry. An idempotent loader
+     survives later bundle evals, so a one-time payloadSummary() snapshot would
+     otherwise lie about newly registered payload versions/kinds/counts. */
+  var publicConfig = null;
+
+  function refreshPublicPayloads() {
+    if (publicConfig) publicConfig.payloads = payloadSummary();
+  }
 
 __ESB64_RUNTIME__
+
+  /* Single-base64 policy (Option C): prefer the canonical shared codec the
+     host bundle installs ($.global.ESB64.atob), falling back to this bundle's
+     inlined lane (the runtime template slot) only when no shared codec is
+     present. The inlined lane stays for standalone/accel-less bundles; hosts
+     that inject esb64 (esb64-atob.jsx) provide the canonical impl so the two
+     never both run. */
+  function b64Atob(s) {
+    try {
+      var g = null;
+      if (typeof $ !== "undefined" && $.global) g = $.global;
+      if (g && g.ESB64 && typeof g.ESB64.atob === "function") return g.ESB64.atob(s);
+    } catch (ignoreShared) {}
+    return __espakB64.atob(s);
+  }
+
+  /* Idempotent loader (Option B): expose a runtime registration API so a
+     multi-bundle file installs ONE loader runtime; later bundles register
+     their payloads instead of shipping a second loader. Mirror of
+     espack-merge.mjs:96-109: same name+version+bytes dedupes, same name with
+     a higher integer version upgrades, conflicts throw. */
+  function registerPayload(p) {
+    if (!p || typeof p.name !== "string") return;
+    var i, prev;
+    for (i = 0; i < PAYLOADS.length; i++) {
+      if (PAYLOADS[i].name === p.name) { prev = PAYLOADS[i]; break; }
+    }
+    if (!prev) { PAYLOADS[PAYLOADS.length] = p; refreshPublicPayloads(); return; }
+    if (prev.version === p.version) {
+      if (prev.b64 !== p.b64 || prev.len !== p.len) {
+        throw new Error("ESPAK: payload conflict for " + p.name + " v" + p.version);
+      }
+      return;
+    }
+    var pv = parseInt(String(prev.version), 10);
+    var nv = parseInt(String(p.version), 10);
+    if (isNaN(pv) || isNaN(nv) || nv <= pv) return;
+    PAYLOADS[i] = p;
+    refreshPublicPayloads();
+  }
+
+  /* Register THIS bundle's payloads into an existing loader runtime (the boot
+     IIFE calls this when a prior bundle already installed the loader).
+     Front-registration preserves the espack facade rule: the LAST-registered
+     bundle's payload 0 is what load(0) resolves to, exactly as if this bundle
+     had installed its own loader (existing "payload bundle is the active
+     facade" convention). Returns true when merged; false tells the boot to
+     replace the runtime instead (this bundle carries a DIFFERENT accel — a
+     version upgrade, not a same-load merge). */
+  function registerInto(existing) {
+    /* A pre-fix shared runtime cannot resolve the accelerator by name once it
+       owns payloads. Do not merge into it: replace that runtime once so
+       long-lived Illustrator engines acquire the corrected resolver. */
+    if (!existing || existing.supportsAccelTargetName !== true) return false;
+    if (accelUpgrades(existing)) return false;
+    var list = [];
+    var k;
+    /* stamp each registered payload with its ORIGIN bundle cache dir so a
+       foreign payload still extracts to its own dir under a shared runtime */
+    for (k = 0; k < PAYLOADS.length; k++) {
+      list[list.length] = { name: PAYLOADS[k].name, version: PAYLOADS[k].version, len: PAYLOADS[k].len, b64: PAYLOADS[k].b64, fileName: PAYLOADS[k].fileName, kind: PAYLOADS[k].kind, dir: cacheDir() };
+    }
+    try { existing.registerPayloadsFront(list); } catch (regErr) { return false; }
+    return true;
+  }
+
+  /* Merge only when the payload capability set is compatible: an accel-less
+     bundle reuses an existing accel; identical accels merge; a bundle that
+     carries a DIFFERENT embedded accel is a new version and must REPLACE the
+     old runtime (its extraction + GC semantics take over). */
+  function accelUpgrades(existing) {
+    var exAccel = null;
+    try { exAccel = existing.config ? existing.config.accel : null; } catch (ignoreCfg) {}
+    if (!hasAccel()) return false;          /* accel-less: always mergeable */
+    if (!exAccel) return true;              /* we carry an accel, old had none -> upgrade */
+    return exAccel.name !== ACCEL_NAME || exAccel.version !== ACCEL_VERSION || exAccel.len !== ACCEL_LEN;
+  }
+
+  /* Front-register this bundle so its payload 0 becomes the shared runtime's
+     index 0. Rebuild through registerPayload() so duplicate names obey the
+     same version/conflict rules as every other registration path. */
+  function registerPayloadsFront(list) {
+    if (!list || !list.length) return;
+    var old = [];
+    var i;
+    for (i = 0; i < PAYLOADS.length; i++) old[i] = PAYLOADS[i];
+    PAYLOADS.length = 0;
+    for (i = 0; i < list.length; i++) registerPayload(list[i]);
+    for (i = 0; i < old.length; i++) registerPayload(old[i]);
+    refreshPublicPayloads();
+  }
 
   function pathJoin(a, b) {
     var s = String(a);
@@ -55,7 +154,13 @@ __ESB64_RUNTIME__
     return defaultCacheDir("espack");
   }
 
-  function payloadPath(i) { return pathJoin(cacheDir(), PAYLOADS[i].fileName); }
+  function payloadPath(i) { return pathJoin(payloadCacheDir(i), PAYLOADS[i].fileName); }
+  /* A registered foreign payload keeps its originating bundle's cache dir
+     (set by registerInto) so extraction lands in the right place even though
+     one loader runtime now serves every bundle in the file. */
+  function payloadCacheDir(i) {
+    return PAYLOADS[i].dir ? String(PAYLOADS[i].dir) : cacheDir();
+  }
   function accelFileName() { return ACCEL_NAME + "_v" + ACCEL_VERSION + ".dll"; }
   function sharedAccelPath() { return pathJoin(accelDir(), SHARED_ACCEL_NAME + "_v" + SHARED_ACCEL_VERSION + ".dll"); }
   function accelPath() {
@@ -106,7 +211,7 @@ __ESB64_RUNTIME__
     } catch (ignore) {}
   }
 
-  function gcPayloadOld(i) { gcOldVersions(cacheDir(), PAYLOADS[i].name, PAYLOADS[i].fileName); }
+  function gcPayloadOld(i) { gcOldVersions(payloadCacheDir(i), PAYLOADS[i].name, PAYLOADS[i].fileName); }
   function gcAccelOld() { gcOldVersions(accelDir(), ACCEL_NAME, accelFileName()); }
 
   /* JSX lane: chunked atob decode -> per-chunk BINARY writes -> length verify. */
@@ -114,11 +219,16 @@ __ESB64_RUNTIME__
     var out = [];
     var n = b64.length;
     var i = 0;
-    while (i < n) {
-      var end = i + CHUNK;
-      if (end > n) end = n;
-      out.push(__espakB64.atob(b64.substring(i, end)));
-      i = end;
+    try {
+      while (i < n) {
+        var end = i + CHUNK;
+        if (end > n) end = n;
+        out.push(b64Atob(b64.substring(i, end)));
+        i = end;
+      }
+    } catch (decodeError) {
+      state.lastError = "ESPAK: base64 decode failed: " + String(decodeError) + "; staying in ES3 mode";
+      return false;
     }
     var f = new File(path);
     f.encoding = "BINARY";
@@ -259,8 +369,8 @@ __ESB64_RUNTIME__
   function nativeExtractPayload(i) {
     state.nativeExtractMs = -1;
     if (!state.accelReady || !state.accelLib) return false;
-    if (!ensureDir(cacheDir())) {
-      state.lastError = "ESPAK: cannot create cache dir \"" + cacheDir() + "\"; staying in ES3 mode";
+    if (!ensureDir(payloadCacheDir(i))) {
+      state.lastError = "ESPAK: cannot create cache dir \"" + payloadCacheDir(i) + "\"; staying in ES3 mode";
       return false;
     }
     var t0 = 0;
@@ -290,11 +400,11 @@ __ESB64_RUNTIME__
          when the JSX-lane fallback succeeds); clear it for the JSX attempt
          only when it was a hard cache-dir failure we are about to retry. */
       var nativeNote = state.lastError;
-      if (!ensureDir(cacheDir())) {
-        state.lastError = "ESPAK: cannot create cache dir \"" + cacheDir() + "\"; staying in ES3 mode";
+      if (!ensureDir(payloadCacheDir(i))) {
+        state.lastError = "ESPAK: cannot create cache dir \"" + payloadCacheDir(i) + "\"; staying in ES3 mode";
         return { ok: false, error: state.lastError };
       }
-      var wrote = jsxWriteExtracted(PAYLOADS[i].b64, PAYLOADS[i].len, payloadPath(i), cacheDir(), PAYLOADS[i].name, PAYLOADS[i].fileName);
+      var wrote = jsxWriteExtracted(PAYLOADS[i].b64, PAYLOADS[i].len, payloadPath(i), payloadCacheDir(i), PAYLOADS[i].name, PAYLOADS[i].fileName);
       if (!wrote) return { ok: false, error: state.lastError };
       if (nativeNote) state.lastError = nativeNote + " (payload extracted via the JSX lane instead)";
     }
@@ -320,7 +430,25 @@ __ESB64_RUNTIME__
     var t0 = 0;
     try { $.hiresTimer; t0 = $.hiresTimer; } catch (e0) {}
     state.lastError = "";
+    /* Timings describe THIS load attempt, not the most recent historical
+       extraction. A shared idempotent loader survives bundle re-evaluation, so
+       stale values would otherwise make skip loads look like re-extractions. */
+    state.accelExtractMs = -1;
+    state.nativeExtractMs = -1;
+    state.payloadExtractMs = -1;
+    state.loadMs = -1;
     var idx = resolvePayload(i);
+    if (idx === -2) {
+      /* Explicit accelerator target. This matters once an accelerator-only
+         bundle has been merged into a shared runtime that also has payloads:
+         the accelerator name is not a payload name and must not resolve
+         through PAYLOADS. */
+      if (!loadAccelLib()) return { ok: false, mode: "es3", error: state.lastError, lib: null, path: accelPath() };
+      state.lib = state.accelLib;
+      state.mode = "native";
+      try { state.loadMs = $.hiresTimer - t0; } catch (e3) {}
+      return { ok: true, mode: "native", lib: state.accelLib, path: accelPath() };
+    }
     if (idx === -1) {
       state.lastError = "ESPAK: unknown payload " + String(i) + " (have " + PAYLOADS.length + ")";
       return { ok: false, mode: "es3", error: state.lastError, lib: null, path: "" };
@@ -371,6 +499,7 @@ __ESB64_RUNTIME__
   }
 
   function resolvePayload(i) {
+    if (typeof i === "string" && hasAccel() && i === ACCEL_NAME) return -2;
     if (PAYLOADS.length === 0) return 0;
     if (typeof i === "string") {
       var k;
@@ -417,15 +546,18 @@ __ESB64_RUNTIME__
     return a;
   }
 
+  publicConfig = {
+    bundleName: BUNDLE_NAME,
+    cacheDir: cacheDir(),
+    chunkSize: CHUNK,
+    accel: hasAccel() ? { name: ACCEL_NAME, version: ACCEL_VERSION, fileName: accelFileName(), len: ACCEL_LEN, dir: accelDir() } : null,
+    payloads: payloadSummary()
+  };
+
   return {
     version: ESPAK_VERSION,
-    config: {
-      bundleName: BUNDLE_NAME,
-      cacheDir: cacheDir(),
-      chunkSize: CHUNK,
-      accel: hasAccel() ? { name: ACCEL_NAME, version: ACCEL_VERSION, fileName: accelFileName(), len: ACCEL_LEN, dir: accelDir() } : null,
-      payloads: payloadSummary()
-    },
+    supportsAccelTargetName: true,
+    config: publicConfig,
     mode: function () { return state.mode; },
     lastError: function () { return state.lastError; },
     accelReady: function () { return state.accelReady; },
@@ -441,7 +573,13 @@ __ESB64_RUNTIME__
     },
     payloadPath: payloadPath,
     cacheDir: cacheDir,
+    registerPayload: registerPayload,
+    registerPayloadsFront: registerPayloadsFront,
+    registerInto: registerInto,
+    accelUpgrades: accelUpgrades,
     extract: function (i) {
+      state.payloadExtractMs = -1;
+      state.nativeExtractMs = -1;
       var idx = resolvePayload(i);
       if (idx === -1) return { ok: false, error: "ESPAK: unknown payload " + String(i) };
       if (isExtracted(idx)) return { ok: true, already: true, lane: "skip", path: payloadPath(idx) };
@@ -457,5 +595,17 @@ __ESB64_RUNTIME__
   var g = null;
   try { if (typeof $ !== "undefined" && $.global) { g = $.global; } } catch (e1) {}
   if (!g) { try { g = (function () { return this; })(); } catch (e2) {} }
-  if (g) { g.ESPAK = ESPACK; }
+  if (!g) return;
+  /* Idempotent install: if a loader runtime is already present on the global
+     (an earlier bundle in this file installed it), register THIS bundle's
+     payloads into that runtime and reuse it — never ship a second loader.
+     Exception: this bundle carries a DIFFERENT embedded accel (a version
+     upgrade) — then it replaces the runtime so its accel extraction + GC
+     take over. The existing runtime remains the facade for merges; its
+     registerPayloadsFront folds this bundle's payloads in so load(0)/load(name)
+     resolve across every registered bundle. */
+  if (g.ESPAK && typeof g.ESPAK.registerPayload === "function" && !ESPACK.accelUpgrades(g.ESPAK)) {
+    if (ESPACK.registerInto(g.ESPAK)) return;
+  }
+  g.ESPAK = ESPACK;
 }());

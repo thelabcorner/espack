@@ -413,6 +413,23 @@ test('loader: skip-extract path (file exists with right size, no write)', functi
   assert.strictEqual(statSync(join(dir, 'FakeDll_v1.dll')).mtimeMs, before, 'file untouched');
 });
 
+test('loader: repeated load resets extraction timings instead of leaking prior attempt', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var r = buildOnce({ dllName: 'FakeDll.dll', name: 'bundle2b', dllVersion: '1' });
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  runBundle(sandbox, r);
+  var ESPAK = sandbox.ESPAK;
+  var first = ESPAK.load(0);
+  assert.strictEqual(first.ok, true);
+  assert.ok(ESPAK.extractMs() >= 0, 'first load performed extraction');
+  var before = statSync(join(root, 'bundle2b', 'FakeDll_v1.dll')).mtimeMs;
+  var second = ESPAK.load(0);
+  assert.strictEqual(second.ok, true);
+  assert.strictEqual(ESPAK.extractMs(), -1, 'cached second load reports no payload extraction');
+  assert.strictEqual(ESPAK.nativeExtractMs(), -1, 'cached second load reports no native extraction');
+  assert.strictEqual(statSync(join(root, 'bundle2b', 'FakeDll_v1.dll')).mtimeMs, before, 'cached file untouched');
+});
+
 test('loader: size mismatch triggers re-extraction', function () {
   var root = mkdtempSync(join(TMP, 'sandbox-'));
   var r = buildOnce({ dllName: 'FakeDll.dll', name: 'bundle3', dllVersion: '1' });
@@ -650,6 +667,56 @@ test('loader: accel-only bundle loads the accelerator as the lib', function () {
   assert.ok(existsSync(join(root, 'espack', 'ESB64Native_v1.dll')), 'accel extracted to shared dir');
 });
 
+test('loader: accelerator name remains attachable when the runtime also has payloads', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var dir = mkdtempSync(join(TMP, 'acc-name-'));
+  var accel = writeDll(dir, 'ESB64Native.dll', DLL_2);
+  var payload = writeDll(dir, 'LibA.dll', DLL_1);
+  var out = join(dir, 'out.jsx');
+  var r = build({ embed: payload, out: out, name: 'accname', accel: accel });
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  runBundle(sandbox, r);
+  var ESPAK = sandbox.ESPAK;
+  assert.strictEqual(ESPAK.config.payloads.length, 1, 'runtime has a normal payload');
+
+  var loaded = ESPAK.load('ESB64Native');
+  assert.strictEqual(loaded.ok, true, loaded.error || 'accelerator load failed');
+  assert.strictEqual(loaded.mode, 'native');
+  assert.strictEqual(loaded.lib.getVersion(), 'stub 1.0.0');
+
+  var attached = ESPAK.attach({
+    es3: null,
+    buildNative: function (lib) { return { version: lib.getVersion() }; }
+  }, 'ESB64Native');
+  assert.strictEqual(attached.ok, true, attached.error || 'accelerator attach failed');
+  assert.strictEqual(attached.mode, 'native');
+  assert.strictEqual(attached.impl.version, 'stub 1.0.0');
+});
+
+test('loader: legacy shared runtime without accelerator-name capability is replaced', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var dir = mkdtempSync(join(TMP, 'legacy-runtime-'));
+  var accel = writeDll(dir, 'ESB64Native.dll', DLL_2);
+  var payload = writeDll(dir, 'LibA.dll', DLL_1);
+  var out = join(dir, 'out.jsx');
+  var r = build({ embed: payload, out: out, name: 'legacyreplace', accel: accel });
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  var legacy = {
+    registerPayload: function () {},
+    config: {
+      accel: {
+        name: r.accel.name,
+        version: r.accel.version,
+        len: r.accel.len
+      }
+    }
+  };
+  sandbox.ESPAK = legacy;
+  runBundle(sandbox, r);
+  assert.notStrictEqual(sandbox.ESPAK, legacy, 'legacy runtime replaced instead of merged');
+  assert.strictEqual(sandbox.ESPAK.supportsAccelTargetName, true);
+});
+
 test('loader: accel native failure falls back to the JSX lane', function () {
   var root = mkdtempSync(join(TMP, 'sandbox-'));
   var r = buildOnce({ dllName: 'FakeDll.dll', name: 'bundle12', dllVersion: '1', accel: true });
@@ -795,22 +862,104 @@ test('loader: shared-accel discovery rejects a non-accelerator DLL at the shared
   assert.ok(/not the ESB64Native accelerator/.test(ESPAK.lastError()), 'reason surfaced: ' + ESPAK.lastError());
 });
 
-test('loader: embedded-accel extraction failure falls back to the shared accel on disk', function () {
+test('packer: defer-b64 omits the inline runtime and ships the defer shim', function () {
+  var dir = mkdtempSync(join(TMP, 'defer-'));
+  var dll = writeDll(dir, 'LibA.dll', DLL_1);
+  var out = join(dir, 'out.jsx');
+  var normal = build({ embed: dll, out: out, name: 'deferA', accel: false });
+  var deferred = build({ embed: dll, out: join(dir, 'out2.jsx'), name: 'deferB', accel: false, deferB64: true });
+  assert.ok(normal.text.indexOf('var __espakB64 = (function') >= 0, 'normal bundle inlines the runtime');
+  assert.ok(normal.text.indexOf('deferred base64 lane') < 0, 'normal bundle has no defer shim');
+  assert.ok(deferred.text.indexOf('var __espakB64 = (function') < 0, 'deferred bundle omits the inline runtime');
+  assert.ok(deferred.text.indexOf('deferred base64 lane') >= 0, 'deferred bundle ships the defer shim');
+  assert.ok(deferred.text.length < normal.text.length, 'deferred bundle is smaller');
+  assert.ok(deferred.text.indexOf('registerPayloadsFront') >= 0, 'idempotent loader API present');
+  new Function(deferred.text); // syntax check
+});
+
+test('loader: idempotent multi-bundle install - second bundle registers, ONE loader', function () {
   var root = mkdtempSync(join(TMP, 'sandbox-'));
-  var sharedDir = join(root, 'espack');
-  mkdirSync(sharedDir, { recursive: true });
-  // different size than the embedded accel -> embedded extraction is attempted
-  writeFileSync(join(sharedDir, 'ESB64Native_v2.dll'), DLL_2);
-  var r = buildOnce({ dllName: 'FakeDll.dll', name: 'bundleD5', dllVersion: '1', accel: true, accelBytes: DLL_1 });
-  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root }, failOpen: true });
+  var dir = mkdtempSync(join(TMP, 'idem-'));
+  var libA = writeDll(dir, 'LibA.dll', DLL_1);
+  var libB = writeDll(dir, 'LibB.dll', DLL_2);
+  var rA = build({ embed: libA, out: join(dir, 'a.jsx'), name: 'bundleA', accel: false });
+  var rB = build({ embed: libB, out: join(dir, 'b.jsx'), name: 'bundleB', accel: false });
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  runBundle(sandbox, rA);
+  runBundle(sandbox, rB);
+  var ESPAK = sandbox.ESPAK;
+  assert.strictEqual(ESPAK.config.payloads.length, 2, 'public config reflects the live deduped registry');
+  assert.strictEqual(ESPAK.config.payloads[0].name, 'LibB', 'front-registered bundle becomes payload index 0');
+  assert.strictEqual(ESPAK.config.payloads[1].name, 'LibA', 'prior payload remains registered');
+  // second bundle did NOT replace the loader: both payloads resolve on ONE runtime
+  var lB = ESPAK.load('LibB');
+  var lA = ESPAK.load('LibA');
+  assert.strictEqual(lB.ok, true, 'B payload resolves (front-registered)');
+  assert.strictEqual(lA.ok, true, 'A payload still resolves');
+  assert.strictEqual(lB.lib, ESPAK.load('LibB').lib, 'B payload loaded from the shared runtime');
+  assert.ok(existsSync(join(root, 'bundleB', 'LibB_v1.dll')), 'B payload extracted');
+  assert.ok(existsSync(join(root, 'bundleA', 'LibA_v1.dll')), 'A payload extracted');
+  // the facade object is A's runtime (single install): no second loader created
+  assert.strictEqual(ESPAK, sandbox.ESPAK, 'facade unchanged by registration');
+});
+
+test('loader: accel upgrade replaces the runtime (version-upgrade path)', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var accelPath = writeDll(mkdtempSync(join(TMP, 'acc-')), 'ESB64Native.dll', DLL_2);
+  var dir = mkdtempSync(join(TMP, 'upg-'));
+  var libA = writeDll(dir, 'LibA.dll', DLL_1);
+  var r1 = build({ embed: libA + '=1', out: join(dir, 'a1.jsx'), name: 'upg', accel: accelPath, accelVersion: '1' });
+  var r2 = build({ embed: libA + '=2', out: join(dir, 'a2.jsx'), name: 'upg', accel: accelPath, accelVersion: '2' });
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  runBundle(sandbox, r1);
+  var first = sandbox.ESPAK;
+  first.load(0); // materialize v1 accel + v1 payload
+  assert.ok(existsSync(join(root, 'espack', 'ESB64Native_v1.dll')), 'v1 accel extracted');
+  runBundle(sandbox, r2);
+  var second = sandbox.ESPAK;
+  assert.strictEqual(second.config.accel.version, '2', 'second bundle REPLACED the runtime (accel v2)');
+  second.load(0); // different payload version -> re-extract -> accel v2 materialized, v1 GCd
+  assert.ok(existsSync(join(root, 'espack', 'ESB64Native_v2.dll')), 'v2 accel extracted');
+  assert.ok(!existsSync(join(root, 'espack', 'ESB64Native_v1.dll')), 'v1 accel GCd');
+  assert.ok(existsSync(join(root, 'upg', 'LibA_v2.dll')), 'payload v2 extracted');
+});
+
+test('loader: defer-b64 uses the host $.global.ESB64.atob to decode', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var dir = mkdtempSync(join(TMP, 'defer-'));
+  var libA = writeDll(dir, 'LibA.dll', DLL_1);
+  var out = join(dir, 'out.jsx');
+  var r = build({ embed: libA, out: out, name: 'deferBundle', accel: false, deferB64: true });
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  // host installs the canonical shared codec before the bundle, like ArcFit's
+  // build.mjs does (esb64-atob injected before the espack block)
+  var usedShared = false;
+  sandbox.ESB64 = { atob: function (s) { usedShared = true; return Buffer.from(s, 'base64').toString('latin1'); } };
   runBundle(sandbox, r);
   var ESPAK = sandbox.ESPAK;
-  var e = ESPAK.extract(0);
-  assert.strictEqual(e.ok, true);
-  assert.strictEqual(e.lane, 'native', 'shared accel on disk -> native lane despite write failure');
-  assert.ok(ESPAK.accelReady(), 'shared accel loaded');
-  var extracted = readFileSync(join(root, 'bundleD5', 'FakeDll_v1.dll'));
-  assert.ok(extracted.equals(Buffer.from(r.payloads[0].b64, 'base64')), 'payload byte-exact');
+  assert.ok(ESPAK, 'ESPAK installed');
+  var l = ESPAK.load(0);
+  assert.strictEqual(l.ok, true, 'defer-b64 bundle loads: ' + (l.error || ''));
+  assert.strictEqual(l.mode, 'native');
+  assert.ok(usedShared, 'decode used the host shared codec, not an inlined lane');
+  var extracted = readFileSync(join(root, 'deferBundle', 'LibA_v1.dll'));
+  assert.ok(extracted.equals(Buffer.from(r.payloads[0].b64, 'base64')), 'payload byte-exact via shared codec');
+});
+
+test('loader: defer-b64 fails open when no shared codec is present', function () {
+  var root = mkdtempSync(join(TMP, 'sandbox-'));
+  var dir = mkdtempSync(join(TMP, 'defer2-'));
+  var libA = writeDll(dir, 'LibA.dll', DLL_1);
+  var out = join(dir, 'out.jsx');
+  var r = build({ embed: libA, out: out, name: 'deferNoShared', accel: false, deferB64: true });
+  var sandbox = makeSandbox(root, { env: { LOCALAPPDATA: root } });
+  // NO $.global.ESB64 and no shared accel -> the deferred lane cannot decode
+  runBundle(sandbox, r);
+  var ESPAK = sandbox.ESPAK;
+  var l = ESPAK.load(0);
+  assert.strictEqual(l.ok, false, 'fails open with a clear error');
+  assert.strictEqual(l.mode, 'es3');
+  assert.ok(/deferred base64 lane/.test(l.error), 'clear defer error: ' + l.error);
 });
 
 run();

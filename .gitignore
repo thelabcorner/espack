@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 tests/.espack-test.bundle.mjs
 tests/.espack-e2e.bundle.mjs
+tests/.consumer-compose.merged.jsx

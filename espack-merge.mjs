@@ -11,7 +11,7 @@ function usage() {
 }
 
 function parseArgs(argv) {
-  var out = { manifests: [], out: null, name: null, cacheDir: undefined, accelDir: '', manifestOut: null, quiet: false };
+  var out = { manifests: [], out: null, name: null, cacheDir: undefined, accelDir: '', manifestOut: null, deferB64: false, quiet: false };
   for (var i = 2; i < argv.length; i++) {
     var a = argv[i];
     if (a === '--merge') {
@@ -21,6 +21,7 @@ function parseArgs(argv) {
     else if (a === '--cache-dir') out.cacheDir = argv[++i];
     else if (a === '--accel-dir') out.accelDir = argv[++i];
     else if (a === '--manifest-out') out.manifestOut = argv[++i];
+    else if (a === '--defer-b64') out.deferB64 = true;
     else if (a === '--quiet') out.quiet = true;
     else { console.error('espack-merge: unknown option: ' + a); usage(); process.exit(2); }
   }
@@ -128,7 +129,8 @@ export function merge(options) {
     cacheDir: manifest.cacheDir,
     payloads: manifest.payloads,
     accel: accelForRender,
-    standalone: false
+    standalone: false,
+    deferB64: !!opts.deferB64
   });
   var outDir = dirname(opts.out);
   if (outDir) mkdirSync(outDir, { recursive: true });
@@ -152,7 +154,8 @@ function main() {
     var r = merge(args);
     if (!args.quiet) {
       console.log('[espack-merge] payloads: ' + r.payloads.map(function (p) { return p.fileName + ' (' + p.len + ' B)'; }).join(', ') +
-        (r.accel ? '  accel: ' + r.accel.fileName + ' (' + r.accel.len + ' B, shared)' : '  accel: none'));
+        (r.accel ? '  accel: ' + r.accel.fileName + ' (' + r.accel.len + ' B, shared)' : '  accel: none') +
+        (args.deferB64 ? '  base64: deferred (host ESB64)' : ''));
       if (!r.accel) console.log('[espack-merge] warning: merged bundle is accel-less');
       console.log('[espack-merge] -> ' + r.outPath + ' (' + r.text.length + ' bytes)  bundle=' + r.bundleName +
         (r.cacheDir ? ' cache=' + r.cacheDir : ' cache=%LOCALAPPDATA%/' + r.bundleName));

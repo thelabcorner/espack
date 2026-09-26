@@ -10,15 +10,23 @@
 //        --out <bundle.jsx> \
 //        [--name <bundle-name>] [--dll-version <v>] [--cache-dir <abs>] \
 //        [--accel <dll> | --no-accel] [--accel-version <v>] [--accel-dir <abs>] \
-//        [--manifest-out <bundle.espack.json>] [--standalone] [--quiet]
+//        [--manifest-out <bundle.espack.json>] [--standalone] [--defer-b64] [--quiet]
 //
 // The emitted bundle is self-contained: it inlines the esb64 atob lane
 // (vendor-esb64-runtime.js from the sibling esb64 repo, or
 // $ESB64_RUNTIME_PATH) so nothing is loaded from disk except the DLLs the
 // bundle itself materializes at runtime. Output is deterministic.
+//
+// --defer-b64: do NOT inline the full esb64 runtime. The loader instead
+// defers to a shared canonical codec ($.global.ESB64.atob) that the host
+// bundle injects before this block (single-base64 policy). Extraction fails
+// open with a clear error when the shared codec is absent. Use only when the
+// host guarantees esb64 presence; it removes the second full decoder from the
+// bundle (D.R.Y / parse-time win).
 import { readFileSync, writeFileSync, mkdirSync, statSync, existsSync } from 'node:fs';
 import { join, dirname, basename, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 var VERSION = '0.4.0';
 var CHUNK_SIZE = 24576; // measured on Illustrator 30.6.0: atob decode is linear
@@ -29,6 +37,43 @@ var TEMPLATE = join(ROOT, 'src', 'loader.jsx');
 var DEFAULT_RUNTIME = join(ROOT, 'vendor', 'esb64-runtime.js');
 var DEFAULT_ACCEL = join(ROOT, 'vendor', 'ESB64Native.dll');
 
+// ESTC packaging gate: the inlined esb64 runtime MUST pass the ExtendScript JSX
+// gate (no esbuild module/descriptor helpers, no persistent polyfill preludes
+// that mutate shared Adobe engine built-ins). Resolved once at load; a missing
+// toolchain is a hard fail (ESTC_DISABLE_GATE=1 is an explicit opt-out only).
+var runtimeEstcCheck = null;
+if (process.env.ESTC_DISABLE_GATE !== '1') {
+  try {
+    var estcRequire = createRequire(import.meta.url);
+    var estcRoot = process.env.ESTC_ROOT || join(ROOT, '..', 'extendscript-toolchain');
+    runtimeEstcCheck = estcRequire(join(estcRoot, 'src', 'check-jsx.mjs')).checkJsxText;
+  } catch (e) {
+    console.error('[espack-build] ESTC packaging gate unavailable: ' + e.message);
+    process.exit(1);
+  }
+}
+
+function assertRuntimeCompatible(label, text) {
+  if (!runtimeEstcCheck) return;
+  var res = runtimeEstcCheck(String(text), {
+    file: label,
+    mode: 'conservative',
+    target: 'illustrator',
+    requireTarget: false,
+    allowIncludes: false,
+    allowJson: false,
+    allowedMissingBuiltins: [],
+    allowedGlobalPatches: []
+  });
+  if (!res.ok) {
+    var detail = res.diagnostics
+      .filter(function (d) { return d.severity === 'error'; })
+      .map(function (d) { return '    ' + d.code + ' ' + (d.line || 0) + ':' + (d.column || 0) + ' ' + d.message; })
+      .join('\n');
+    throw new Error(label + ' failed the ESTC ExtendScript packaging gate:\n' + detail);
+  }
+}
+
 var TOKENS = [
   '__ESPAK_VERSION__', '__BUNDLE_NAME__', '__CACHE_DIR__', '__CHUNK_SIZE__',
   '__PAYLOADS__', '__PAYLOAD_SUMMARY__',
@@ -37,12 +82,22 @@ var TOKENS = [
   '__ESB64_RUNTIME__'
 ];
 
+var DEFERRED_B64_RUNTIME = [
+  '/* deferred base64 lane (--defer-b64): no inlined decoder. The canonical',
+  '   shared codec ($.global.ESB64.atob) injected by the host bundle is the',
+  '   ONLY base64 implementation this loader uses. Fails open with a clear',
+  '   error if the host did not provide it. */',
+  'var __espakB64 = {',
+  '  atob: function (s) { throw new Error("ESPAK: deferred base64 lane requires $.global.ESB64.atob (host must inject esb64 before this bundle)"); }',
+  '};'
+].join('\n');
+
 function usage() {
   console.log('usage: node espack-build.mjs --embed <dll>[=<ver>] [--embed ...] --out <bundle.jsx> [--name <name>] [--dll-version <v>] [--cache-dir <abs>] [--accel <dll> | --no-accel] [--accel-version <v>] [--accel-dir <abs>] [--manifest-out <json>] [--standalone] [--quiet]');
 }
 
 function parseArgs(argv) {
-  var out = { embeds: [], out: null, name: null, dllVersion: '1', cacheDir: undefined, accel: undefined, accelVersion: '1', accelDir: '', manifestOut: null, standalone: false, quiet: false };
+  var out = { embeds: [], out: null, name: null, dllVersion: '1', cacheDir: undefined, accel: undefined, accelVersion: '1', accelDir: '', manifestOut: null, standalone: false, deferB64: false, quiet: false };
   for (var i = 2; i < argv.length; i++) {
     var a = argv[i];
     if (a === '--embed') out.embeds.push(argv[++i]);
@@ -56,6 +111,7 @@ function parseArgs(argv) {
     else if (a === '--accel-dir') out.accelDir = argv[++i];
     else if (a === '--manifest-out') out.manifestOut = argv[++i];
     else if (a === '--standalone') out.standalone = true;
+    else if (a === '--defer-b64') out.deferB64 = true;
     else if (a === '--quiet') out.quiet = true;
     else { console.error('espack: unknown option: ' + a); usage(); process.exit(2); }
   }
@@ -213,20 +269,28 @@ function payloadsLiteral(payloads) {
 
 export function renderBundle(opts) {
   var runtimePath = opts.runtimePath || process.env.ESB64_RUNTIME_PATH || DEFAULT_RUNTIME;
-  if (!existsSync(runtimePath)) {
+  if (!opts.deferB64 && !existsSync(runtimePath)) {
     throw new Error('espack: esb64 runtime not found at ' + runtimePath + ' (build esb64 first or set ESB64_RUNTIME_PATH)');
   }
 
   var template = readFileSync(TEMPLATE, 'utf8');
-  var runtime = readFileSync(runtimePath, 'utf8');
+  var runtime = null;
+  if (!opts.deferB64) {
+    runtime = readFileSync(runtimePath, 'utf8');
+    // Fail closed: never inline an Illustrator-incompatible esbuild runtime.
+    assertRuntimeCompatible('inlined esb64 runtime (' + runtimePath + ')', runtime);
+  }
   var payloads = clonePayloads(opts.payloads || []);
   var accel = opts.accel ? cloneAccel(opts.accel) : null;
 
   // the inlined atob/btoa lane: wrap the vetted esb64 runtime in a local scope
   // and surface the ESB64 exports object as __espakB64 (its internal `var
   // ESB64` becomes function-local; the runtime's own gap-fill footer is inert
-  // inside this scope and does not leak).
-  var runtimeWrapper = 'var __espakB64 = (function () {\n' + runtime + '\nreturn ESB64;\n}());';
+  // inside this scope and does not leak). --defer-b64 omits the inlined lane
+  // entirely (single-base64 policy: the loader uses the host's $.global.ESB64).
+  var runtimeWrapper = opts.deferB64
+    ? DEFERRED_B64_RUNTIME
+    : 'var __espakB64 = (function () {\n' + runtime + '\nreturn ESB64;\n}());';
 
   var payloadSummary = payloads.length
     ? payloads.map(function (p) { return p.fileName + ' (' + p.len + ' B)'; }).join(', ')
@@ -309,7 +373,7 @@ export function build(options) {
     };
   }
 
-  var out = renderBundle({ bundleName: bundleName, cacheDir: cacheDir, payloads: payloads, accel: accel, standalone: opts.standalone });
+  var out = renderBundle({ bundleName: bundleName, cacheDir: cacheDir, payloads: payloads, accel: accel, standalone: opts.standalone, deferB64: !!opts.deferB64 });
 
   var outDir = dirname(opts.out);
   if (outDir) mkdirSync(outDir, { recursive: true });
@@ -343,7 +407,8 @@ function main() {
       accelVersion: args.accelVersion,
       accelDir: args.accelDir,
       manifestOut: args.manifestOut,
-      standalone: args.standalone
+      standalone: args.standalone,
+      deferB64: args.deferB64
     });
     if (!args.quiet) {
       console.log('[espack-build] payloads: ' + r.payloads.map(function (p) { return p.fileName + ' (' + p.len + ' B)'; }).join(', ') +
