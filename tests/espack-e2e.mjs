@@ -17,7 +17,7 @@ import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from '../espack-build.mjs';
 import { merge } from '../espack-merge.mjs';
-import { createLegacyComToolV2Runner } from '../../extendscript-toolchain/src/comtool-v2-compat.mjs';
+import { createComToolRunner } from '../../extendscript-toolchain/src/comtool-compat.mjs';
 
 var ROOT = dirname(fileURLToPath(import.meta.url));
 var DLL = join(ROOT, '..', 'vendor', 'ESB64Native.dll');
@@ -25,8 +25,7 @@ var DIST = join(ROOT, '..', 'dist');
 var CACHE = join(process.env.LOCALAPPDATA || '', 'espack-e2e-test');
 var BLOCKER = join(process.env.LOCALAPPDATA || '', 'espack-e2e-fail.txt');
 var SHARED_ACCEL_DIR = join(process.env.LOCALAPPDATA || '', 'espack');
-var COM = createLegacyComToolV2Runner();
-process.on('exit', function () { try { COM.close(); } catch (ignore) {} });
+var COM = createComToolRunner();
 
 var dllBytes = readFileSync(DLL);
 console.log('E2E: DLL ' + basename(DLL) + ' ' + dllBytes.length + ' bytes; cache ' + CACHE);
@@ -36,21 +35,21 @@ function check(name, cond, detail) {
   if (cond) console.log('ok   ' + name);
   else { failures++; console.log('FAIL ' + name + (detail ? '  ' + detail : '')); }
 }
-function runTool(args, timeoutMs) {
+async function runTool(args, timeoutMs) {
   return COM.run(args, { timeoutMs: timeoutMs || 180000 });
 }
-function evalFile(path) {
+async function evalFile(path) {
   // CLI contract: env.ok = tool success (script errors set env.ok=false);
   // env.result = the script's value directly (null for undefined - the bundle
   // itself returns nothing; its job is installing ESPAK on $.global).
-  var env = runTool(['eval', '--file', path.replace(/\\/g, '/')]);
+  var env = await runTool(['eval', '--file', path.replace(/\\/g, '/')]);
   if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
   return env.result;
 }
-function evalCode(code) {
+async function evalCode(code) {
   // The COM wrapper swallows plain completion values (ES3 function-body
   // semantics), so the value must be returned explicitly.
-  var env = runTool(['eval', '--code', 'return ' + code]);
+  var env = await runTool(['eval', '--code', 'return ' + code]);
   if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
   return env.result;
 }
@@ -59,8 +58,8 @@ function evalCode(code) {
 // separate calls; re-eval'ing the bundle atomically with the smoke makes the
 // assertions race-free (re-eval is idempotent: extraction skips, lib cache
 // hits, mtime/extractMs unchanged).
-function evalSmoke(bundlePath) {
-  var env = runTool(['eval', '--code',
+async function evalSmoke(bundlePath) {
+  var env = await runTool(['eval', '--code',
     '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return ' + SMOKE]);
   if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
   return env.result;
@@ -92,8 +91,8 @@ var SMOKE_MULTI = '(function () {' +
   '  return out;' +
   '}());';
 
-function evalMulti(bundlePath) {
-  var env = runTool(['eval', '--code',
+async function evalMulti(bundlePath) {
+  var env = await runTool(['eval', '--code',
     '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return ' + SMOKE_MULTI]);
   if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
   return env.result;
@@ -122,8 +121,8 @@ var SMOKE_MERGED = '(function () {' +
   '  return out;' +
   '}());';
 
-function evalMerged(bundlePath) {
-  var env = runTool(['eval', '--code',
+async function evalMerged(bundlePath) {
+  var env = await runTool(['eval', '--code',
     '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return ' + SMOKE_MERGED]);
   if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
   return env.result;
@@ -131,8 +130,8 @@ function evalMerged(bundlePath) {
 
 // Shared-loader ordering probe: the first loader object stays global while
 // compatible later bundles front-register their payloads.
-function evalConfig(bundlePath) {
-  var env = runTool(['eval', '--code',
+async function evalConfig(bundlePath) {
+  var env = await runTool(['eval', '--code',
     '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return { bundleName: $.global.ESPAK.config.bundleName, payloads: $.global.ESPAK.config.payloads.length, payload0: $.global.ESPAK.config.payloads.length ? $.global.ESPAK.config.payloads[0].name : null };']);
   if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
   return env.result;
@@ -158,8 +157,8 @@ var SMOKE_FILE = '(function () {' +
   '  return out;' +
   '}());';
 
-function evalFilePayload(bundlePath) {
-  var env = runTool(['eval', '--code',
+async function evalFilePayload(bundlePath) {
+  var env = await runTool(['eval', '--code',
     '$.evalFile(File("' + bundlePath.replace(/\\/g, '/') + '")); return ' + SMOKE_FILE]);
   if (!env.ok) throw new Error('eval failed: ' + JSON.stringify(env).slice(0, 1500));
   return env.result;
@@ -210,12 +209,12 @@ function buildBundle(version, extra) {
   return build(opts);
 }
 
-function killAllAutomation() {
+async function killAllAutomation() {
   // Release the current V2 target lease and owned RuntimeHost BEFORE killing
   // Illustrator. The next status --launch call will discover the new strong
   // target identity and acquire a fresh lease instead of retaining stale
   // process/lease state across the cross-session GC test.
-  COM.reset();
+  await COM.reset();
   execFileSync('powershell.exe', ['-NoProfile', '-Command',
     '$p = Get-Process -Name Illustrator -ErrorAction SilentlyContinue; if ($p) { $p | Stop-Process -Force }; exit 0'],
     { timeout: 30000 });
@@ -231,16 +230,16 @@ function rmRetry(p) {
     }
   }
 }
-function launchFresh() {
-  var env = runTool(['status', '--launch'], 90000);
+async function launchFresh() {
+  var env = await runTool(['status', '--launch'], 90000);
   if (!env.ok) throw new Error('instance launch failed: ' + JSON.stringify(env).slice(0, 1000));
   return env.result;
 }
 
 // ---- instance A (fresh, owned by this run) ------------------------------------
 console.log('E2E: killing any leftover automation instances and launching a fresh one...');
-killAllAutomation();
-var instA = launchFresh();
+await killAllAutomation();
+var instA = await launchFresh();
 check('instance A fresh (' + instA.Version + ', ' + instA.DocumentsCount + ' docs)', instA.DocumentsCount === 0);
 
 if (existsSync(CACHE)) rmSync(CACHE, { recursive: true, force: true });
@@ -253,7 +252,7 @@ mkdirSync(DIST, { recursive: true });
 
 // v1: extract -> load -> smoke
 buildBundle(1);
-var s1 = evalSmoke(bundlePath(1));
+var s1 = await evalSmoke(bundlePath(1));
 check('v1: bundle evals, ESPAK installed', s1.ok === true, s1.error);
 check('v1: native mode', s1.mode === 'native', 'mode=' + s1.mode);
 check('v1: native b64 vectors', s1.b64enc === 'aGVsbG8=' && s1.b64dec === 'hello', JSON.stringify({ enc: s1.b64enc, dec: s1.b64dec }));
@@ -274,7 +273,7 @@ console.log('      v1 extractMs=' + s1.extractMs + ' us (' + (s1.extractMs / 100
 // re-run: skip-extract path (atomic re-eval = fresh ESPAK instance; no
 // extraction happened in its lifetime -> extractMs -1; the mtime check is
 // the decisive no-re-extraction proof)
-var s1b = evalSmoke(bundlePath(1));
+var s1b = await evalSmoke(bundlePath(1));
 check('re-run: still native', s1b.mode === 'native' && s1b.ok === true);
 check('re-run: no re-extraction (fresh instance, extractMs -1)', s1b.extractMs === -1, 'extractMs=' + s1b.extractMs);
 check('re-run: no re-extraction (file mtime unchanged)', statSync(extractedPath(1)).mtimeMs === v1mtime, 'mtime changed');
@@ -283,7 +282,7 @@ check('re-run: file untouched', existsSync(extractedPath(1)));
 
 // v2: version bump in same host
 buildBundle(2);
-var s2 = evalSmoke(bundlePath(2));
+var s2 = await evalSmoke(bundlePath(2));
 check('v2: loaded native', s2.ok === true && s2.mode === 'native', s2.error);
 check('v2: new versioned file', s2.config.payloads[0].fileName === 'ESB64Native_v2.dll');
 check('v2: accel NOT re-extracted (shared, already on system)', s2.accelExtractMs === -1, 'accelExtractMs=' + s2.accelExtractMs);
@@ -298,19 +297,19 @@ writeFileSync(BLOCKER, 'blocker');
 var failDll = join(DIST, 'FailLib.dll');
 writeFileSync(failDll, dllBytes);
 var failBundle = build({ embed: failDll, out: join(DIST, 'espack-e2e-fail.jsx'), name: 'espack-e2e-fail', dllVersion: '1', cacheDir: BLOCKER.replace(/\\/g, '/') });
-var sf = evalSmoke(failBundle.outPath);
+var sf = await evalSmoke(failBundle.outPath);
 check('fail-path: load fails cleanly', sf.loadOk === false, JSON.stringify(sf));
 check('fail-path: stays es3', sf.mode === 'es3');
 // Live engine: Folder.exists is true for a path that exists as a FILE, so the
 // blocker surfaces as a write failure ("cannot open ... for writing") rather
 // than an ensureDir failure; both are clean, surfaced errors.
 check('fail-path: clear error', sf.error && (sf.error.indexOf('cannot create cache dir') >= 0 || sf.error.indexOf('cannot open') >= 0), sf.error);
-var af = evalCode(ATTACH_ES3);
+var af = await evalCode(ATTACH_ES3);
 check('fail-path: attach stays es3, es3 impl active', af.mode === 'es3' && af.implAtob === 'es3-atob', JSON.stringify(af));
 
 // v3: another bump; GC best-effort (v1+v2 locked -> survive)
 buildBundle(3);
-var s3 = evalSmoke(bundlePath(3));
+var s3 = await evalSmoke(bundlePath(3));
 check('v3: loaded native', s3.ok === true && s3.mode === 'native', s3.error);
 check('v3: extracted', existsSync(extractedPath(3)));
 check('v3: v1+v2 survive (locked, GC best-effort)', existsSync(extractedPath(1)) && existsSync(extractedPath(2)));
@@ -318,10 +317,10 @@ console.log('      v3 extractMs=' + s3.extractMs + ' us (' + (s3.extractMs / 100
 
 // ---- fresh instance B: GC across sessions --------------------------------------
 console.log('E2E: closing instance A and launching a fresh instance B...');
-killAllAutomation();
-launchFresh();
+await killAllAutomation();
+await launchFresh();
 buildBundle(4);
-var s4 = evalSmoke(bundlePath(4));
+var s4 = await evalSmoke(bundlePath(4));
 check('v4 (fresh instance): loaded native', s4.ok === true && s4.mode === 'native', s4.error);
 check('v4 (fresh instance): extracted', existsSync(extractedPath(4)));
 check('v4: GC removed v1 (unlocked)', !existsSync(extractedPath(1)), 'v1 still present');
@@ -338,14 +337,14 @@ var lib2Dll = join(DIST, 'Lib2.dll');
 writeFileSync(lib1Dll, dllBytes);
 writeFileSync(lib2Dll, dllBytes);
 var lib1 = build({ embed: lib1Dll, out: join(DIST, 'espack-e2e-lib1.jsx'), name: 'espack-e2e-lib1', dllVersion: '1' });
-var sl1 = evalSmoke(lib1.outPath);
+var sl1 = await evalSmoke(lib1.outPath);
 check('lib1: native via shared accel', sl1.ok === true && sl1.mode === 'native', sl1.error);
 check('lib1: accel skipped (already on system)', sl1.accelExtractMs === -1, 'accelExtractMs=' + sl1.accelExtractMs);
 check('lib1: accel file untouched', statSync(join(SHARED_ACCEL_DIR, 'ESB64Native_v1.dll')).mtimeMs === accelMtime, 'mtime changed');
 check('lib1: payload native extraction', sl1.nativeExtractMs >= 0, String(sl1.nativeExtractMs));
 check('lib1: byte-exact', readFileSync(join(process.env.LOCALAPPDATA, 'espack-e2e-lib1', 'Lib1_v1.dll')).equals(dllBytes));
 var lib2 = build({ embed: lib2Dll, out: join(DIST, 'espack-e2e-lib2.jsx'), name: 'espack-e2e-lib2', dllVersion: '1' });
-var sl2 = evalSmoke(lib2.outPath);
+var sl2 = await evalSmoke(lib2.outPath);
 check('lib2: native via shared accel', sl2.ok === true && sl2.mode === 'native', sl2.error);
 check('lib2: accel skipped again', sl2.accelExtractMs === -1, 'accelExtractMs=' + sl2.accelExtractMs);
 check('lib2: accel file untouched', statSync(join(SHARED_ACCEL_DIR, 'ESB64Native_v1.dll')).mtimeMs === accelMtime, 'mtime changed');
@@ -359,7 +358,7 @@ var libB = join(DIST, 'LibB.dll');
 writeFileSync(libA, dllBytes);
 writeFileSync(libB, dllBytes);
 var multiBundle = build({ embed: [libA, libB], out: join(DIST, 'espack-e2e-multi.jsx'), name: 'espack-e2e-multi', dllVersion: '1' });
-var sm = evalMulti(multiBundle.outPath);
+var sm = await evalMulti(multiBundle.outPath);
 check('multi: bundle registers both payloads into shared loader', sm.ok === true && sm.payloads >= 2 && sm.payload0 === 'LibA', JSON.stringify({ payloads: sm.payloads, payload0: sm.payload0, error: sm.error }));
 check('multi: load(0) + load-by-name all native', sm.ok0 === true && sm.okA === true && sm.okB === true && sm.modeA === 'native' && sm.modeB === 'native', JSON.stringify(sm));
 check('multi: load-by-name resolves to index 0 (same lib)', sm.sameLib === true, 'sameLib=' + sm.sameLib);
@@ -384,13 +383,13 @@ var mergeBDir = join(process.env.LOCALAPPDATA, 'espack-e2e-mergeB');
 // The FIRST installed loader object remains $.global.ESPAK. Compatible later
 // bundles front-register their payloads, so the latest bundle's payload 0 is
 // what load(0) resolves to without replacing the loader object itself.
-var smA = evalSmoke(bundleA.outPath);
+var smA = await evalSmoke(bundleA.outPath);
 check('shared loader: A front-registered after A eval', smA.config.payloads.length >= 1 && smA.config.payloads[0].name === 'LibA', JSON.stringify(smA.config));
 check('migration: A payload extracted into its own dir', smA.isExtractedAfter === true && existsSync(join(mergeADir, 'LibA_v1.dll')));
-var smB = evalSmoke(bundleB.outPath);
+var smB = await evalSmoke(bundleB.outPath);
 check('shared loader: B front-registered after B eval', smB.config.payloads.length >= 1 && smB.config.payloads[0].name === 'LibB', JSON.stringify(smB.config));
 check('migration: B payload extracted into its own dir', smB.isExtractedAfter === true && existsSync(join(mergeBDir, 'LibB_v1.dll')));
-var smM1 = evalMerged(merged.outPath);
+var smM1 = await evalMerged(merged.outPath);
 check('shared loader: merged bundle front-registers manifest payload 0', smM1.payloads >= 2 && smM1.payload0 === 'LibA', JSON.stringify({ bundleName: smM1.bundleName, payloads: smM1.payloads, payload0: smM1.payload0 }));
 
 // cache migration: the merged bundle reuses the first manifest's cache dir
@@ -405,10 +404,10 @@ check('merged: old mergeB copy stale but harmless', existsSync(join(mergeBDir, '
 check('merged: native b64 vectors both payloads', smM1.b64encA === 'aGVsbG8=' && smM1.b64encB === 'aGVsbG8=', JSON.stringify({ a: smM1.b64encA, b: smM1.b64encB }));
 var mergedLibAMtime = statSync(join(mergeADir, 'LibA_v1.dll')).mtimeMs;
 var mergedLibBMtime = statSync(join(mergeADir, 'LibB_v1.dll')).mtimeMs;
-var smM2 = evalMerged(merged.outPath);
+var smM2 = await evalMerged(merged.outPath);
 check('merged re-run: skip-extract (extractMs -1)', smM2.ok === true && smM2.extractMs === -1, 'extractMs=' + smM2.extractMs);
 check('merged re-run: files untouched (mtime unchanged)', statSync(join(mergeADir, 'LibA_v1.dll')).mtimeMs === mergedLibAMtime && statSync(join(mergeADir, 'LibB_v1.dll')).mtimeMs === mergedLibBMtime, 'mtime changed');
-var cfgM = evalConfig(merged.outPath);
+var cfgM = await evalConfig(merged.outPath);
 check('shared loader: merged payload ordering stable after re-eval', cfgM.payloads >= 2 && cfgM.payload0 === 'LibA', JSON.stringify(cfgM));
 console.log('      merged extractMs=' + smM1.extractMs + ' us (' + (smM1.extractMs / 1000).toFixed(1) + ' ms)  re-run extractMs=' + smM2.extractMs + ' us');
 
@@ -419,7 +418,7 @@ var toolExe = join(DIST, 'Tool.exe');
 writeFileSync(toolExe, fileBytes);
 var fileBundle = build({ embed: toolExe, out: join(DIST, 'espack-e2e-file.jsx'), name: 'espack-e2e-file', dllVersion: '1' });
 check('file: kind=file, versioned exe name', fileBundle.payloads[0].kind === 'file' && fileBundle.payloads[0].fileName === 'Tool_v1.exe', JSON.stringify(fileBundle.payloads[0]));
-var sf = evalFilePayload(fileBundle.outPath);
+var sf = await evalFilePayload(fileBundle.outPath);
 check('file: bundle evals, extract ok, load rejected', sf.ok === true && sf.extractOk === true && sf.loadRejected === true, JSON.stringify(sf));
 check('file: extract via native lane (shared accel) or skip', sf.extractLane === 'native' || sf.extractLane === 'skip', 'lane=' + sf.extractLane);
 check('file: kind surfaced in config', sf.kind === 'file', 'kind=' + sf.kind);
@@ -430,7 +429,7 @@ check('file: extracted bytes byte-exact vs source', readFileSync(join(process.en
 
 // ---- cleanup -------------------------------------------------------------------
 console.log('E2E: closing instance B...');
-killAllAutomation();
+await killAllAutomation();
 rmRetry(CACHE);
 rmRetry(SHARED_ACCEL_DIR);
 rmRetry(join(process.env.LOCALAPPDATA, 'espack-e2e-lib1'));

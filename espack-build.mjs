@@ -27,8 +27,15 @@ import { readFileSync, writeFileSync, mkdirSync, statSync, existsSync } from 'no
 import { join, dirname, basename, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import {
+  cloneCapabilities,
+  cloneLibraries,
+  sha256Bytes,
+  validateCapabilities,
+  validateLibraryManifestFields
+} from './espack-libraries.mjs';
 
-var VERSION = '0.4.0';
+var VERSION = '0.5.0';
 var CHUNK_SIZE = 24576; // measured on Illustrator 30.6.0: atob decode is linear
 // (~1 us/base64 char, no engine wedge through 64K passes); 24K is conservative.
 
@@ -169,15 +176,33 @@ function manifestPayloads(payloads) {
 }
 
 export function makeManifest(opts) {
-  return {
+  var libraries = cloneLibraries(opts.libraries || []);
+  var capabilities = cloneCapabilities(opts.capabilities || []);
+  var entries = (opts.entries || []).map(function (entry) {
+    if (typeof entry === 'string') return { id: String(entry), range: '*' };
+    return { id: String(entry.id), range: String(entry.range === undefined || entry.range === null ? '*' : entry.range) };
+  });
+  var version = libraries.length || entries.length || capabilities.length ? 2 : 1;
+  var out = {
     format: 'espack-manifest',
-    version: 1,
+    version: version,
     bundleName: opts.bundleName,
     cacheDir: opts.cacheDir,
     chunkSize: CHUNK_SIZE,
     accel: opts.accel ? cloneManifestAccel(opts.accel) : null,
     payloads: manifestPayloads(opts.payloads || []),
   };
+  if (version === 2) {
+    out.composer = { name: 'espack', version: VERSION };
+    out.payloads.forEach(function (payload) {
+      payload.sha256 = sha256Bytes(Buffer.from(payload.b64, 'base64'));
+    });
+    if (out.accel) out.accel.sha256 = sha256Bytes(Buffer.from(out.accel.b64, 'base64'));
+    out.libraries = libraries;
+    out.entries = entries;
+    out.capabilities = capabilities;
+  }
+  return out;
 }
 
 function payloadKind(p) {
@@ -239,7 +264,7 @@ export function readManifest(path) {
 export function validateManifest(m, label) {
   if (!m || typeof m !== 'object') throw new Error('espack: manifest is not an object: ' + label);
   if (m.format !== 'espack-manifest') throw new Error('espack: unsupported manifest format in ' + label + ': ' + String(m.format));
-  if (m.version !== 1) throw new Error('espack: unsupported manifest version in ' + label + ': ' + String(m.version));
+  if (m.version !== 1 && m.version !== 2) throw new Error('espack: unsupported manifest version in ' + label + ': ' + String(m.version));
   if (m.bundleName === undefined || m.bundleName === null || m.bundleName === '') throw new Error('espack: manifest missing bundleName: ' + label);
   if (m.cacheDir === undefined || m.cacheDir === null) throw new Error('espack: manifest missing cacheDir: ' + label);
   if (m.chunkSize !== CHUNK_SIZE) throw new Error('espack: unsupported manifest chunkSize in ' + label + ': ' + String(m.chunkSize));
@@ -253,6 +278,45 @@ export function validateManifest(m, label) {
   if (m.accel) {
     ['name', 'version', 'len', 'b64', 'fileName'].forEach(function (k) {
       if (m.accel[k] === undefined || m.accel[k] === null || m.accel[k] === '') throw new Error('espack: accel missing ' + k + ' in ' + label);
+    });
+  }
+  if (m.version === 2) {
+    if (!m.composer || m.composer.name !== 'espack' || !m.composer.version) {
+      throw new Error('espack: manifest v2 missing composer provenance: ' + label);
+    }
+    m.payloads.forEach(function (p, i) {
+      if (!/^[0-9a-f]{64}$/.test(String(p.sha256 || ''))) {
+        throw new Error('espack: payload #' + i + ' missing/invalid sha256 in ' + label);
+      }
+      var actual = sha256Bytes(Buffer.from(String(p.b64), 'base64'));
+      if (actual !== p.sha256) throw new Error('espack: payload #' + i + ' sha256 mismatch in ' + label);
+    });
+    if (m.accel) {
+      if (!/^[0-9a-f]{64}$/.test(String(m.accel.sha256 || ''))) {
+        throw new Error('espack: accel missing/invalid sha256 in ' + label);
+      }
+      var accelActual = sha256Bytes(Buffer.from(String(m.accel.b64), 'base64'));
+      if (accelActual !== m.accel.sha256) throw new Error('espack: accel sha256 mismatch in ' + label);
+    }
+    validateLibraryManifestFields(m, label);
+    validateCapabilities(m.capabilities, label);
+    var manifestCapabilities = cloneCapabilities(m.capabilities || []);
+    var providers = Object.create(null);
+    m.libraries.forEach(function (lib) { providers[lib.id] = true; });
+    var payloadNames = Object.create(null);
+    m.payloads.forEach(function (p) { payloadNames[p.name] = true; });
+    manifestCapabilities.forEach(function (cap) {
+      if (!providers[cap.provider]) {
+        throw new Error('espack: capability ' + cap.id + ' provider is not present in libraries: ' + cap.provider);
+      }
+      for (var ci = 0; ci < cap.payloads.length; ci++) {
+        if (!payloadNames[cap.payloads[ci]]) {
+          throw new Error('espack: capability ' + cap.id + ' references missing payload ' + cap.payloads[ci]);
+        }
+      }
+      if (cap.accel && (!m.accel || m.accel.name !== cap.accel)) {
+        throw new Error('espack: capability ' + cap.id + ' references missing accelerator ' + cap.accel);
+      }
     });
   }
 }

@@ -1,14 +1,23 @@
 {
   "name": "espack",
-  "version": "0.4.1",
-  "description": "ESPACK - self-extracting single-file ExternalObject bundles for ExtendScript (ES3). At build time a DLL is embedded as base64 inside a .jsx; at runtime the JSX unpacks itself (chunked decode via the inlined esb64 atob lane), materializes the DLL into a per-user cache dir, loads it via ExternalObject, and switches a consumer library from its ES3 fallback to the native accelerated implementation.",
+  "version": "0.5.0",
+  "description": "ESPACK - deterministic runtime/library composition and self-extracting ExternalObject bundles for ExtendScript (ES3).",
   "type": "module",
   "main": "espack-build.mjs",
   "scripts": {
     "build": "node espack-build.mjs",
     "vendor-sync": "node espack-vendor-sync.mjs",
-    "test": "node tests/espack-test.mjs && node tests/espack-merge-test.mjs && node tests/vendor-sync-test.mjs && node tests/espack-consumer-compose-test.mjs",
-    "e2e": "node tests/espack-e2e.mjs"
+    "test": "node tests/espack-test.mjs && node tests/espack-merge-test.mjs && node tests/espack-libraries-test.mjs && node tests/vendor-sync-test.mjs && node tests/espack-consumer-compose-test.mjs",
+    "e2e": "node tests/espack-e2e.mjs",
+    "compose:live": "node tests/espack-compose-live.mjs",
+    "estc:static": "node ../extendscript-toolchain/bin/estc.mjs check dist/ESPAK-demo.accel.jsx --no-target",
+    "estc:live-parse": "node ../extendscript-toolchain/bin/estc.mjs check dist/ESPAK-demo.accel.jsx --no-target --live --launch",
+    "verify": "npm run test && npm run estc:static",
+    "verify:engine": "npm run estc:live-parse && npm run compose:live",
+    "ci:static": "npm run verify",
+    "ci:local": "npm run ci:static && npm run verify:engine",
+    "release:gate": "npm run ci:local",
+    "prepublishOnly": "npm run release:gate"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -26,6 +35,8 @@
     "self-extracting",
     "base64",
     "atob",
+    "composition",
+    "dependency-resolution",
     "illustrator",
     "single-file"
   ]

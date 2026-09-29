@@ -365,7 +365,7 @@ test('loader: extract writes byte-exact DLL, load reaches native, attach swaps',
   runBundle(sandbox, r);
   var ESPAK = sandbox.ESPAK;
   assert.ok(ESPAK, 'ESPAK installed on $.global');
-  assert.strictEqual(ESPAK.version, '0.4.0');
+  assert.strictEqual(ESPAK.version, '0.5.0');
   assert.strictEqual(ESPAK.config.payloads.length, 1);
   assert.strictEqual(ESPAK.config.payloads[0].fileName, 'FakeDll_v1.dll');
   assert.strictEqual(ESPAK.config.accel, null, 'no accel in bundle');

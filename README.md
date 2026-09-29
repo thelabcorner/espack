@@ -1,10 +1,10 @@
 <div align="center">
 
-# ESPACK: Self-Extracting ExternalObject Bundles for Adobe ExtendScript (ES3)
+# ESPACK: Deterministic Runtime Composition + Self-Extracting ExternalObject Bundles for Adobe ExtendScript (ES3)
 
 ## ExtendScript PACKer = E.S.PACK
 
-### The build-time packer + ES3 self-extracting loader that ships ExternalObject DLLs inside a single `.jsx` for Adobe Illustrator, InDesign, Photoshop & any ExtendScript host
+### One build-time dependency resolver and one ES3 runtime control plane for flattening ES* libraries, optional native capabilities, and ExternalObject payloads into deterministic single-file `.jsx` distributions
 
 [![Parity: byte-exact native/ES3](https://img.shields.io/badge/parity-byte--exact%20native%2FES3-success)](#performance)
 [![Tests: 33 Node + 50%2B live](https://img.shields.io/badge/tests-33%20Node%20%2B%2050%2B%20live-purple)](#validation)
@@ -54,6 +54,21 @@ Deterministic random streams and sampling for ExtendScript.
 **[ESUUID](https://github.com/thelabcorner/es-uuid)**  
 RFC 9562 UUID generation, parsing, and conversion for ExtendScript.
 
+**[ESENV](https://github.com/thelabcorner/es-env)**  
+Environment and capability detection for ExtendScript.
+
+**[ESPATH](https://github.com/thelabcorner/es-path)**  
+Deterministic Windows/POSIX path and RFC 8089 file-URI transformations.
+
+**[ESFS](https://github.com/thelabcorner/es-fs)**  
+Synchronous ExtendScript File/Folder I/O with explicit text, BINARY, and replacement semantics.
+
+**[ESHASH](https://github.com/thelabcorner/es-hash)**  
+CRC-32/ISO-HDLC and SHA-256 for byte strings and UTF-8 text.
+
+**[ESLOG](https://github.com/thelabcorner/es-log)**  
+Structured logging with bounded text and JSONL sinks.
+
 </td>
 <td width="50%" valign="top">
 
@@ -79,6 +94,9 @@ Native state and durable storage for Adobe tooling.
 
 **[COMTool](https://github.com/thelabcorner/COMTool)**  
 Guarded COM, ExtendScript, plug-in, and debugger automation for Adobe desktop apps.
+
+**ESsemble** <sub>coming soon</sub>  
+Typed framework, resolver, and composition layer for the ExtendScript toolkit.
 
 **ESOBF** <sub>coming soon</sub>  
 Obfuscation for hardened JSX distribution.
@@ -239,14 +257,23 @@ loads them via `ExternalObject`.
 
 ## Composition & merge (manifest-assisted)
 
-ESPAK composes several bundles into ONE at build time — the model the family
-uses to ship eson + esarr + arcfit as a single composed file with one loader,
-one shared accelerator, and N payloads.
+ESPACK has two intentionally compatible manifest generations:
 
-### The manifest contract (schema v1)
+- **manifest v1** is the original native/file payload contract. Existing v1
+  producers remain valid and retain their byte-compatible merge behavior;
+- **manifest v2** is the library/runtime composition contract. It adds
+  semantic library identity/version requirements, deterministic transitive
+  resolution, activation contracts, SHA-256 provenance, and optional native
+  capability metadata while preserving the same payload/accelerator layer.
 
-`espack-build.mjs --manifest-out <path>` emits a deterministic sidecar
-manifest (fixed key order, no machine paths):
+The important invariant is the same in both cases: a composed distribution has
+**one ESPAK loader/control plane**. A dependency never brings along a nested
+loader or a nested accelerator bundle.
+
+### Manifest v1: native/file payloads
+
+`espack-build.mjs --manifest-out <path>` with no library metadata emits the
+legacy deterministic v1 sidecar:
 
 ```json
 {
@@ -260,17 +287,82 @@ manifest (fixed key order, no machine paths):
 }
 ```
 
-`accel` is `null` for `--no-accel` bundles. The manifest is the merge input;
-it is never loaded at runtime.
+`accel` is `null` for `--no-accel` bundles. The manifest is a build-time
+merge input; it is never read from disk by the ExtendScript runtime.
 
-### Merging
+### Manifest v2: runtime/library composition
+
+When a producer supplies `libraries`, `entries`, or native capability
+metadata, `makeManifest()` emits schema v2. A library record carries the exact
+UTF-8 facade bytes plus the contract needed to resolve and activate it:
+
+```json
+{
+  "format": "espack-manifest",
+  "version": 2,
+  "composer": { "name": "espack", "version": "0.5.0" },
+  "libraries": [{
+    "id": "eslog",
+    "version": "0.2.0",
+    "activation": {
+      "global": "ESLOG",
+      "type": "object",
+      "contract": [{ "name": "createLogger", "type": "function" }]
+    },
+    "requires": [{ "id": "eson", "range": "^1.3.0", "optional": false }],
+    "optionalRequires": [],
+    "artifact": {
+      "fileName": "ESLOG.facade.jsx",
+      "encoding": "utf8-base64",
+      "len": 12663,
+      "sha256": "...",
+      "b64": "..."
+    },
+    "provenance": {
+      "package": "eslog",
+      "repository": "https://github.com/thelabcorner/es-log.git",
+      "commit": "...",
+      "artifact": "dist/ESLOG.facade.jsx"
+    }
+  }],
+  "entries": [{ "id": "eslog", "range": "=0.2.0" }],
+  "capabilities": []
+}
+```
+
+The resolver accepts exact versions, caret/tilde ranges, comparator sets,
+wildcards, and OR ranges. It selects the highest version satisfying the full
+constraint set, then emits a stable dependency-first activation order.
+Transitive copies of an identical library are deduplicated. The same
+identity/version with different bytes, activation metadata, dependencies, or
+provenance is a hard composition conflict.
+
+Required dependency cycles fail with the concrete cycle path. Optional
+dependencies may be absent; an optional back-edge that would close a cycle is
+dropped deterministically and surfaced as a composition diagnostic.
+
+Every v2 payload, accelerator, and library artifact is SHA-256 verified before
+composition. `composer.name/version` records which ESPACK schema/control-plane
+implementation generated the sidecar.
+
+Native acceleration is a **capability layer on a library**, not a second
+library runtime. A capability declares its provider library, whether it is
+`optional` or `required`, and the payload/accelerator records it needs. This
+keeps pure JSX fallback and native delivery separate while still flattening
+both into one distribution.
+
+### Merging / resolving
 
 `espack-merge.mjs --merge <m1.json> <m2.json> ... --out <bundle.jsx>` reads
-the manifests and re-renders ONE loader with ONE shared accelerator and N
-payloads. Merge happens **pre-minify/pre-obfuscate** — the merged bundle is
-the normal deterministic output, so minified/obfuscated variants are produced
-by the same downstream pipeline as any other bundle. Collision policy (hard
-errors, not warnings):
+v1 and/or v2 manifests, resolves any library roots, and renders ONE normal
+ESPAK loader, ONE composition control-plane extension when libraries are
+present, ONE shared accelerator, N payload/file records, then the flattened
+library sources in dependency-first order.
+
+Merge happens **pre-minify/pre-obfuscate**. Minified/obfuscated variants are
+derived only after the final dependency graph has been resolved.
+
+Binary collision policy remains:
 
 - same payload name+version+same b64 → dedupe (keep one)
 - same payload name+version+different b64 → HARD ERROR
@@ -282,23 +374,39 @@ errors, not warnings):
 - merged bundle name defaults to the FIRST manifest's bundleName; its cache
   dir is reused, so payloads already extracted there are skipped
 
+Library collision/resolution policy is independent of payload integer versions:
+
+- same library id + version + identical normalized metadata/bytes -> dedupe;
+- same id + version with any byte/contract/dependency/provenance difference ->
+  **HARD ERROR**;
+- multiple candidate semantic versions -> solve all declared ranges and select
+  the highest compatible candidate;
+- no valid solution -> **HARD ERROR** naming the unsatisfied roots/dependencies;
+- required cycle -> **HARD ERROR** with the concrete cycle path.
+
 ### Composition model
 
-Four layers:
+The canonical v2 model has four layers:
 
-1. **Runtime** — one loader per composed file (the emitted `ESPAK` facade).
-2. **Tooling** — `espack-build --manifest-out` + `espack-merge`.
-3. **Consumers** — manifest + loader-free facade artifacts; adapters load by
-   payload NAME (`ESONJson` / `ESARRArray` / `ArcFit_IPC`), never `load(0)`.
-4. **Composer** — the build script (e.g. arcfit `build.mjs`) runs
-   `espack-merge`, then appends the consumer facades.
+1. **Resolver** — semantic identities/ranges are solved and flattened at build
+   time; callers never manually preload sibling libraries for a composed
+   distribution.
+2. **Control plane** — one emitted `ESPAK` object owns binary registration,
+   library identity, cross-evaluation deduplication, activation verification,
+   and conflict diagnostics.
+3. **Library facades** — loader-free ES3 sources activate explicit globals only
+   after their dependencies. Examples now live-proven through COMTool V2:
+   `ESB64 -> ESON -> ESLOG` and `ESRAND -> ESUUID`.
+4. **Capabilities** — native DLL/file payloads and the shared ESB64 accelerator
+   are layered onto the resolved library graph without nesting another loader.
 
-Facade ordering: `$.global.ESPAK` is **last-wins** — the merged bundle must be
-evaluated LAST in the injection order so its facade (all payloads) is the
-active one. Cache migration: payloads move from `%LOCALAPPDATA%\<old-bundle>`
-to the merged dir; old extracted files become stale but harmless (GC is
-scoped per DLL name inside the merged cache dir only, so the merged bundle
-never deletes the old bundles' files).
+The runtime registry is persistent on `$.global`. Re-evaluating the exact same
+library id/version/hash is a no-op; trying to activate another version or
+different bytes under an already-active identity fails *before* the conflicting
+source executes.
+
+Payload cache migration behavior is unchanged: old extracted files may remain
+stale but harmless, and GC remains scoped per payload name.
 
 ---
 
@@ -349,6 +457,12 @@ ESPAK.accelExtractMs();   // JSX-lane accelerator extraction µs (-1 = skipped/a
 ESPAK.nativeExtractMs();  // native payload extraction µs (-1 = JSX lane used)
 ESPAK.extractMs();        // last payload extraction µs (either lane)
 ESPAK.loadMs();
+ESPAK.supportsLibraryComposition; // true for a v2-capable control plane
+ESPAK.libraries;            // active library registry (activation order)
+ESPAK.libraryInfo(id);      // { id, version, sha256, globalName } | null
+ESPAK.libraryList();        // snapshot of the active registry
+ESPAK.prepareLibrary(spec); // internal composer guard: skip identical / reject conflict
+ESPAK.activateLibrary(spec);// internal composer activation-contract verification
 ```
 
 Cache directories: payloads in `%LOCALAPPDATA%\<bundle-name>\`, the shared
