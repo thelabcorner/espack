@@ -216,7 +216,7 @@ valid `{"a":1}`). Fixed in `eson/src/parse.ts` (NUL texts never memoized).
 **How it works, in three steps:**
 
 1. Open the [Releases page](https://github.com/thelabcorner/espack/releases).
-2. Pick the **latest stable** tag (top of the list — today that is `v0.4.0`).
+2. Pick the **latest stable** tag.
 3. Download the asset that matches your use case:
 
 | You are... | Take this release | And this asset |
@@ -529,7 +529,7 @@ ESPAK.attach({
 ```
 
 If you need a ready-made full facade, esb64's own accelerated bundle
-(`ESB64.accel.jsx`, shipped in esb64 v1.1.0) is the reference
+(`ESB64.accel.jsx`, shipped in ESB64 v1.3.0) is the reference
 implementation of this exact pattern.
 
 #### The capability switch (`attach`)
